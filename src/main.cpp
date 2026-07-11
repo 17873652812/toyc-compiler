@@ -1,6 +1,8 @@
 
   #include <iostream>
   #include <string>
+   #include "defs.h"
+  using namespace toyc;
   using namespace std;
 
   int main() {
