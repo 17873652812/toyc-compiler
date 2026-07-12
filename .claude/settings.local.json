@@ -43,7 +43,9 @@
       "Bash(/c/Users/jiure/Desktop/toyc/compiler.exe)",
       "Bash(git add *)",
       "Bash(git commit *)",
-      "Bash(./compiler.exe -opt test/test0.tc)"
+      "Bash(./compiler.exe -opt test/test0.tc)",
+      "Bash(git remote *)",
+      "Bash(git push *)"
     ]
   }
 }
