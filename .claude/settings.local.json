@@ -45,7 +45,8 @@
       "Bash(git commit *)",
       "Bash(./compiler.exe -opt test/test0.tc)",
       "Bash(git remote *)",
-      "Bash(git push *)"
+      "Bash(git push *)",
+      "Bash(git rm *)"
     ]
   }
 }
