@@ -1,8 +1,8 @@
-
   #include <iostream>
   #include <string>
   #include "defs.h"
   #include "token.h"
+  #include "lexer.h"
   using namespace std;
   using namespace toyc;
 
@@ -13,12 +13,22 @@
           source += line + '\n';
       }
 
-      // 测试：手动创建一个 Token，看看能不能打印
-      Token t(TokenKind::KW_INT, "int", Position{1, 1});
-      cout << "kind: " << t.kind_name() << endl;
-      cout << "text: " << t.lexeme << endl;
-      cout << "pos:  line " << t.pos.line << ", col " << t.pos.col <<
-  endl;
+      if (source.empty()) {
+          cerr << "empty input" << endl;
+          return 1;
+      }
+
+      // 用 Lexer 把源码切成 Token
+      Lexer lexer(source);
+      auto tokens = lexer.tokenize();
+
+      // 把每个 Token 打印出来
+      for (const auto& tok : tokens) {
+          cout << tok.kind_name()
+               << " '" << tok.lexeme << "'"
+               << "  at " << tok.pos.line << ":" << tok.pos.col
+               << endl;
+      }
 
       return 0;
   }
