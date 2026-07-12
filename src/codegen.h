@@ -14,11 +14,7 @@ public:
 
     std::string generate() {
         out_ << ".text\n";
-        out_ << ".globl _start\n_start:\n";
-        out_ << "    call main\n";
-        out_ << "    li a7, 93\n";
-        out_ << "    ecall\n\n";
-
+        // 不定义 _start —— 评测系统的 C 运行时会提供 _start 并调用 main
         for (const auto& func : unit_.funcs)
             gen_func(func.get());
         return out_.str();
