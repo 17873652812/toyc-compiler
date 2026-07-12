@@ -148,8 +148,8 @@ private:
             if (i < 8)
                 out_ << "    sw " << arg_reg(i) << ", " << off << "(sp)\n";
             else {
-                // 栈参数：在调用者帧中，偏移 = callee_帧 + 调用者_溢出区
-                int caller_off = stack_size_ + (i - 8) * 4;
+                // 栈参数：调用者存在 sp 负偏移，callee 用 stack_size_ - N 读取
+                int caller_off = stack_size_ - (i - 8 + 1) * 4;
                 out_ << "    lw t0, " << caller_off << "(sp)\n";
                 out_ << "    sw t0, " << off << "(sp)\n";
             }
@@ -308,23 +308,17 @@ private:
 
     void gen_call(const CallExpr* call) {
         int n = (int)call->args.size();
-        int overflow = n > 8 ? n - 8 : 0;
-        // 栈上预留溢出参数空间
-        if (overflow > 0)
-            out_ << "    addi sp, sp, -" << (overflow * 4) << "\n";
         // 寄存器参数 a0-a7
         for (int i = 0; i < std::min(n, 8); i++) {
             gen_expr(call->args[i].get());
             out_ << "    mv " << arg_reg(i) << ", t0\n";
         }
-        // 栈上溢出参数
+        // 溢出参数：存到 sp 负偏移（调用者栈下方，callee 会找到）
         for (int i = 8; i < n; i++) {
             gen_expr(call->args[i].get());
-            out_ << "    sw t0, " << ((i - 8) * 4) << "(sp)\n";
+            out_ << "    sw t0, -" << ((i - 8 + 1) * 4) << "(sp)\n";
         }
         out_ << "    call " << call->func_name << "\n";
-        if (overflow > 0)
-            out_ << "    addi sp, sp, " << (overflow * 4) << "\n";
         out_ << "    mv t0, a0\n";
     }
 
