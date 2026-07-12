@@ -6,38 +6,61 @@
 
 namespace toyc {
 
-// Token 的类型（计算机里存数字，写代码用名字）
+// Token 的类型
 enum class TokenKind {
+    // 关键字
     KW_INT,      // int
     KW_RETURN,   // return
-    IDENT,       // 标识符（用户起的名字）
-    NUMBER,      // 数字字面量
+
+    // 标识符 & 字面量
+    IDENT,       // 名字
+    NUMBER,      // 数字
+
+    // 运算符（v0.2 新增）
+    PLUS,        // +
+    MINUS,       // -
+    STAR,        // *
+    SLASH,       // /
+    PERCENT,     // %
+    ASSIGN,      // =
+    NOT,         // !
+    COMMA,       // ,
+
+    // 界符
     LPAREN,      // (
     RPAREN,      // )
     LBRACE,      // {
     RBRACE,      // }
     SEMICOLON,   // ;
+
+    // 特殊
     END,         // 文件结束
     ERR,         // 非法字符
 };
 
-// Token：源码里的一个"单词"（类型 + 文字 + 位置）
 struct Token {
     TokenKind kind;
     std::string lexeme;
     Position pos;
 
-    // 构造函数：一行创建 Token
     Token(TokenKind k, std::string lex, Position p)
         : kind(k), lexeme(std::move(lex)), pos(p) {}
 
-    // 调试用：把 Token 类型从数字翻译成文字（0→"KW_INT"，2→"IDENT"...）
+    // 调试用：类型转文字
     std::string kind_name() const {
         switch (kind) {
             case TokenKind::KW_INT:     return "KW_INT";
             case TokenKind::KW_RETURN:  return "KW_RETURN";
             case TokenKind::IDENT:      return "IDENT";
             case TokenKind::NUMBER:     return "NUMBER";
+            case TokenKind::PLUS:       return "PLUS";
+            case TokenKind::MINUS:      return "MINUS";
+            case TokenKind::STAR:       return "STAR";
+            case TokenKind::SLASH:      return "SLASH";
+            case TokenKind::PERCENT:    return "PERCENT";
+            case TokenKind::ASSIGN:     return "ASSIGN";
+            case TokenKind::NOT:        return "NOT";
+            case TokenKind::COMMA:      return "COMMA";
             case TokenKind::LPAREN:     return "LPAREN";
             case TokenKind::RPAREN:     return "RPAREN";
             case TokenKind::LBRACE:     return "LBRACE";
@@ -50,7 +73,7 @@ struct Token {
     }
 };
 
-// 关键字字典（"int"→KW_INT, "return"→KW_RETURN），Lexer 用
+// 关键字字典
 inline const std::unordered_map<std::string, TokenKind> keywords = {
     {"int",    TokenKind::KW_INT},
     {"return", TokenKind::KW_RETURN},

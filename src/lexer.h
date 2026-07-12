@@ -96,6 +96,15 @@ private:
             case '{': return make(TokenKind::LBRACE, "{", p);
             case '}': return make(TokenKind::RBRACE, "}", p);
             case ';': return make(TokenKind::SEMICOLON, ";", p);
+            // v0.2 新增运算符
+            case '+': return make(TokenKind::PLUS, "+", p);
+            case '-': return make(TokenKind::MINUS, "-", p);
+            case '*': return make(TokenKind::STAR, "*", p);
+            case '/': return make(TokenKind::SLASH, "/", p);
+            case '%': return make(TokenKind::PERCENT, "%", p);
+            case '=': return make(TokenKind::ASSIGN, "=", p);
+            case '!': return make(TokenKind::NOT, "!", p);
+            case ',': return make(TokenKind::COMMA, ",", p);
             default:  return make(TokenKind::ERR, std::string(1, c), p);
         }
     }
