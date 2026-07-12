@@ -53,7 +53,9 @@
       "Bash(git clone *)",
       "Read(//tmp/**)",
       "Bash(rm -rf /tmp/test-clone)",
-      "Bash(grep -E '\\\\.exe$')"
+      "Bash(grep -E '\\\\.exe$')",
+      "Bash(cat)",
+      "Bash(./compiler.exe /tmp/all_tests.tc)"
     ]
   }
 }

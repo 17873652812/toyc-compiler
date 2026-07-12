@@ -131,10 +131,11 @@ private:
         for (auto& p : func->params) alloc_var(p);
         int nvars = count_vars(func->body.get());
         int total_vars = (int)func->params.size() + nvars;
-        int frame_size = total_vars * 4 + 4;
+        int frame_size = total_vars * 4 + 4 + 256;  // +256 临时值缓冲区
         if (frame_size < 16) frame_size = 16;
         frame_size = (frame_size + 15) & ~15;
         stack_size_ = frame_size;
+        temp_base_ = total_vars * 4 + 4;  // 变量区之后，ra之前
 
         out_ << ".globl " << func->name << "\n" << func->name << ":\n";
         out_ << "    addi sp, sp, -" << stack_size_ << "\n";
@@ -368,14 +369,15 @@ private:
         throw std::runtime_error("non-const expression in const init");
     }
 
-    // ---- 临时栈 ----
+    // ---- 临时栈（用帧内正偏移，函数调用不会覆盖） ----
+    int temp_base_ = 0;  // 在 gen_func 中设置
 
     void push_t0() {
         extra_stack_ += 4;
-        out_ << "    sw t0, -" << extra_stack_ << "(sp)\n";
+        out_ << "    sw t0, " << (temp_base_ + extra_stack_) << "(sp)\n";
     }
     void pop_to_t1() {
-        out_ << "    lw t1, -" << extra_stack_ << "(sp)\n";
+        out_ << "    lw t1, " << (temp_base_ + extra_stack_) << "(sp)\n";
         extra_stack_ -= 4;
     }
 
