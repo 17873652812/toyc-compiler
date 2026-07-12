@@ -103,7 +103,7 @@ private:
         return block;
     }
 
-    // Stmt → VarDecl | AssignStmt | ReturnStmt | IfStmt | Block
+    // Stmt → ... | WhileStmt | BreakStmt | ContinueStmt | Block
     std::unique_ptr<ASTNode> parse_stmt() {
         if (match(TokenKind::KW_INT)) {
             return parse_var_decl();
@@ -116,8 +116,19 @@ private:
         if (match(TokenKind::KW_IF)) {
             return parse_if_stmt();
         }
+        if (match(TokenKind::KW_WHILE)) {
+            return parse_while_stmt();
+        }
+        if (match(TokenKind::KW_BREAK)) {
+            expect(TokenKind::SEMICOLON, "expected ';'");
+            return std::make_unique<BreakStmt>();
+        }
+        if (match(TokenKind::KW_CONTINUE)) {
+            expect(TokenKind::SEMICOLON, "expected ';'");
+            return std::make_unique<ContinueStmt>();
+        }
         if (check(TokenKind::LBRACE)) {
-            return parse_block();  // 花括号块也是一种语句
+            return parse_block();
         }
         if (check(TokenKind::IDENT)) {
             return parse_assign_stmt();
@@ -146,7 +157,6 @@ private:
     }
 
     // IfStmt → 'if' '(' Expr ')' Stmt ('else' Stmt)?
-    // （'if' 已在 parse_stmt 里 match 掉了）
     std::unique_ptr<IfStmt> parse_if_stmt() {
         expect(TokenKind::LPAREN, "expected '(' after 'if'");
         auto cond = parse_expr();
@@ -158,6 +168,16 @@ private:
         }
         return std::make_unique<IfStmt>(std::move(cond),
             std::move(then_stmt), std::move(else_stmt));
+    }
+
+    // WhileStmt → 'while' '(' Expr ')' Stmt（v0.4）
+    // （'while' 已在 parse_stmt 里 match 掉了）
+    std::unique_ptr<WhileStmt> parse_while_stmt() {
+        expect(TokenKind::LPAREN, "expected '(' after 'while'");
+        auto cond = parse_expr();
+        expect(TokenKind::RPAREN, "expected ')'");
+        auto body = parse_stmt();
+        return std::make_unique<WhileStmt>(std::move(cond), std::move(body));
     }
 
     // ---- 表达式（按优先级分层） ----

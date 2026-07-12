@@ -77,12 +77,26 @@ struct AssignStmt : ASTNode {
 struct IfStmt : ASTNode {
     std::unique_ptr<ASTNode> cond;
     std::unique_ptr<ASTNode> then_stmt;
-    std::unique_ptr<ASTNode> else_stmt;  // 可为空
+    std::unique_ptr<ASTNode> else_stmt;
     IfStmt(std::unique_ptr<ASTNode> c,
            std::unique_ptr<ASTNode> t,
            std::unique_ptr<ASTNode> e)
         : cond(std::move(c)), then_stmt(std::move(t)), else_stmt(std::move(e)) {}
 };
+
+// while 语句：while (cond) body（v0.4）
+struct WhileStmt : ASTNode {
+    std::unique_ptr<ASTNode> cond;
+    std::unique_ptr<ASTNode> body;
+    WhileStmt(std::unique_ptr<ASTNode> c, std::unique_ptr<ASTNode> b)
+        : cond(std::move(c)), body(std::move(b)) {}
+};
+
+// break 语句（v0.4）
+struct BreakStmt : ASTNode {};
+
+// continue 语句（v0.4）
+struct ContinueStmt : ASTNode {};
 
 // ---- 顶层 ----
 

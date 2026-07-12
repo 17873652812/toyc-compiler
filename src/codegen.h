@@ -36,6 +36,12 @@ private:
     int label_count_ = 0;
     int new_label() { return label_count_++; }
 
+    // 循环标签栈：支持嵌套 while（v0.4）
+    // 每进入一个 while，push 一对标签（begin, end）
+    // break → 跳去 end_label，continue → 跳去 begin_label
+    struct LoopLabels { int begin, end; };
+    std::vector<LoopLabels> loops_;
+
     // 统计 Block 里有多少个 VarDecl
     int count_vars(const Block* block) {
         int n = 0;
@@ -135,6 +141,40 @@ private:
             return;
         }
 
+        // WhileStmt：while (cond) body（v0.4）
+        if (auto* ws = dynamic_cast<const WhileStmt*>(stmt)) {
+            int begin_lbl = new_label();
+            int end_lbl = new_label();
+
+            loops_.push_back({begin_lbl, end_lbl});  // 入栈
+
+            out_ << ".L" << begin_lbl << ":\n";       // 循环开始标签
+            gen_expr(ws->cond.get());                  // 计算条件
+            out_ << "    beqz t0, .L" << end_lbl << "\n";  // 条件为假，退出循环
+            gen_stmt(ws->body.get());                  // 循环体
+            out_ << "    j .L" << begin_lbl << "\n";  // 跳回条件判断
+            out_ << ".L" << end_lbl << ":\n";          // 循环结束标签
+
+            loops_.pop_back();                         // 出栈
+            return;
+        }
+
+        // BreakStmt（v0.4）
+        if (dynamic_cast<const BreakStmt*>(stmt)) {
+            if (loops_.empty())
+                throw std::runtime_error("break outside of loop");
+            out_ << "    j .L" << loops_.back().end << "\n";
+            return;
+        }
+
+        // ContinueStmt（v0.4）
+        if (dynamic_cast<const ContinueStmt*>(stmt)) {
+            if (loops_.empty())
+                throw std::runtime_error("continue outside of loop");
+            out_ << "    j .L" << loops_.back().begin << "\n";
+            return;
+        }
+
         throw std::runtime_error("Codegen: unknown statement");
     }
 
@@ -178,17 +218,15 @@ private:
 
     // ---- 栈操作辅助 ----
 
-    // 把 t0 压入栈（临时保存）
+    // 把 t0 压入临时栈（不改 sp，用负偏移，避免破坏变量地址）
     void push_t0() {
-        out_ << "    addi sp, sp, -4\n";
-        out_ << "    sw t0, 0(sp)\n";
         extra_stack_ += 4;
+        out_ << "    sw t0, -" << extra_stack_ << "(sp)\n";
     }
 
-    // 从栈弹出到 t1
+    // 从临时栈弹出到 t1
     void pop_to_t1() {
-        out_ << "    lw t1, 0(sp)\n";
-        out_ << "    addi sp, sp, 4\n";
+        out_ << "    lw t1, -" << extra_stack_ << "(sp)\n";
         extra_stack_ -= 4;
     }
 
