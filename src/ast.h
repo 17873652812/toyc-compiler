@@ -128,9 +128,10 @@ struct FuncDef : ASTNode {
           params(std::move(ps)), body(std::move(b)) {}
 };
 
-// 程序根节点
+// 程序根节点（v1.0：加入全局变量）
 struct CompUnit : ASTNode {
     std::vector<std::unique_ptr<FuncDef>> funcs;
+    std::vector<std::unique_ptr<ASTNode>> globals;  // 全局 VarDecl 或 ConstDecl
 };
 
 }  // namespace toyc

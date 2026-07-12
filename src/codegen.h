@@ -12,12 +12,43 @@ public:
     explicit Codegen(const CompUnit& unit, bool opt = false)
         : unit_(unit), opt_(opt) {}
 
+    std::unordered_map<std::string, int> global_vars_;  // 全局变量名 → 值
+
     std::string generate() {
+        // 先记录全局变量的值到 map（后面 IdExpr 会查）
+        for (auto& g : unit_.globals) {
+            if (auto* vd = dynamic_cast<const VarDecl*>(g.get()))
+                global_vars_[vd->name] = eval_const(vd->init.get());
+            else if (auto* cd = dynamic_cast<const ConstDecl*>(g.get()))
+                global_vars_[cd->name] = eval_const(cd->init.get());
+        }
+
+        // 全局变量放 .data 段（v1.0）
+        if (!unit_.globals.empty()) {
+            out_ << ".data\n";
+            for (auto& g : unit_.globals) {
+                gen_global(g.get());
+            }
+        }
+
         out_ << ".text\n";
         // 不定义 _start —— 评测系统的 C 运行时会提供 _start 并调用 main
         for (const auto& func : unit_.funcs)
             gen_func(func.get());
         return out_.str();
+    }
+
+    // 生成全局变量/常量
+    void gen_global(const ASTNode* node) {
+        if (auto* vd = dynamic_cast<const VarDecl*>(node)) {
+            out_ << ".globl " << vd->name << "\n";
+            out_ << vd->name << ":\n";
+            out_ << "    .word " << eval_const(vd->init.get()) << "\n";
+        } else if (auto* cd = dynamic_cast<const ConstDecl*>(node)) {
+            out_ << ".globl " << cd->name << "\n";
+            out_ << cd->name << ":\n";
+            out_ << "    .word " << eval_const(cd->init.get()) << "\n";
+        }
     }
 
 private:
@@ -164,13 +195,23 @@ private:
             return;
         }
         if (auto* id = dynamic_cast<const IdExpr*>(expr)) {
-            // 先查常量表（v1.0）
+            // 查找顺序：常量 > 局部变量 > 全局变量
             auto ci = consts_.find(id->name);
             if (ci != consts_.end()) {
                 out_ << "    li t0, " << ci->second << "\n";
                 return;
             }
             auto it = symtab_.find(id->name);
+            if (it != symtab_.end()) {
+                out_ << "    lw t0, " << it->second << "(sp)\n";
+                return;
+            }
+            auto gi = global_vars_.find(id->name);
+            if (gi != global_vars_.end()) {
+                out_ << "    li t0, " << gi->second << "\n";
+                return;
+            }
+            throw std::runtime_error("undefined: " + id->name);
             if (it == symtab_.end()) throw std::runtime_error("undefined: " + id->name);
             out_ << "    lw t0, " << it->second << "(sp)\n";
             return;

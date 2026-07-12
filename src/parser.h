@@ -12,13 +12,35 @@ public:
     explicit Parser(std::vector<Token> tokens)
         : tokens_(std::move(tokens)), pos_(0) {}
 
+    // 预读 N 个 Token，看第 N 个是什么类型（0=当前）
+    TokenKind lookahead(int n) const {
+        if (pos_ + n < tokens_.size())
+            return tokens_[pos_ + n].kind;
+        return TokenKind::ERR;
+    }
+
     std::unique_ptr<CompUnit> parse() {
         auto unit = std::make_unique<CompUnit>();
         while (!is_end()) {
-            if (check(TokenKind::KW_INT) || check(TokenKind::KW_VOID)) {
+            // const int X = ...; → 全局常量
+            if (check(TokenKind::KW_CONST)) {
+                unit->globals.push_back(parse_const_decl());
+            }
+            // int IDENT ( ... → 函数定义
+            // int IDENT = ... → 全局变量
+            else if (check(TokenKind::KW_INT)) {
+                if (lookahead(1) == TokenKind::IDENT && lookahead(2) == TokenKind::LPAREN) {
+                    unit->funcs.push_back(parse_func_def());
+                } else {
+                    advance();  // 吃掉 int
+                    unit->globals.push_back(parse_var_decl());
+                }
+            }
+            else if (check(TokenKind::KW_VOID)) {
                 unit->funcs.push_back(parse_func_def());
-            } else {
-                error("expected 'int' or 'void'");
+            }
+            else {
+                error("expected 'int', 'void', or 'const'");
             }
         }
         return unit;
@@ -83,8 +105,10 @@ private:
     std::unique_ptr<Block> parse_block() {
         expect(TokenKind::LBRACE, "expected '{'");
         auto block = std::make_unique<Block>();
-        while (!is_end() && peek().kind != TokenKind::RBRACE)
-            block->stmts.push_back(parse_stmt());
+        while (!is_end() && peek().kind != TokenKind::RBRACE) {
+            auto s = parse_stmt();
+            if (s) block->stmts.push_back(std::move(s));  // null = 空语句
+        }
         expect(TokenKind::RBRACE, "expected '}'");
         return block;
     }
@@ -92,6 +116,8 @@ private:
     // ---- 语句 ----
 
     std::unique_ptr<ASTNode> parse_stmt() {
+        // 空语句 ";"（BNF 规定可单独出现）
+        if (match(TokenKind::SEMICOLON)) return nullptr;
         // const int x = expr;（v1.0）
         if (match(TokenKind::KW_CONST)) {
             return parse_const_decl();
