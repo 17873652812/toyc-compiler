@@ -141,11 +141,18 @@ private:
         out_ << "    addi sp, sp, -" << stack_size_ << "\n";
         out_ << "    sw ra, " << (stack_size_ - 4) << "(sp)\n";
 
-        // 只保存前 8 个寄存器参数（a0-a7），超出部分暂不支持
-        int nparams = std::min((int)func->params.size(), 8);
-        for (int i = 0; i < nparams; i++) {
+        // 保存寄存器参数（a0-a7）+ 栈参数（从调用者栈读取）
+        int np = (int)func->params.size();
+        for (int i = 0; i < np; i++) {
             int off = symtab_.back()[func->params[i]];
-            out_ << "    sw " << arg_reg(i) << ", " << off << "(sp)\n";
+            if (i < 8)
+                out_ << "    sw " << arg_reg(i) << ", " << off << "(sp)\n";
+            else {
+                // 栈参数：在调用者帧中，偏移 = callee_帧 + 调用者_溢出区
+                int caller_off = stack_size_ + (i - 8) * 4;
+                out_ << "    lw t0, " << caller_off << "(sp)\n";
+                out_ << "    sw t0, " << off << "(sp)\n";
+            }
         }
 
         // 函数体直接遍历，不通过 gen_block（避免重复 enter_scope）
@@ -300,12 +307,24 @@ private:
     // ---- 函数调用 ----
 
     void gen_call(const CallExpr* call) {
-        int n = std::min((int)call->args.size(), 8);  // 最多 8 个寄存器参数
-        for (int i = 0; i < n; i++) {
+        int n = (int)call->args.size();
+        int overflow = n > 8 ? n - 8 : 0;
+        // 栈上预留溢出参数空间
+        if (overflow > 0)
+            out_ << "    addi sp, sp, -" << (overflow * 4) << "\n";
+        // 寄存器参数 a0-a7
+        for (int i = 0; i < std::min(n, 8); i++) {
             gen_expr(call->args[i].get());
             out_ << "    mv " << arg_reg(i) << ", t0\n";
         }
+        // 栈上溢出参数
+        for (int i = 8; i < n; i++) {
+            gen_expr(call->args[i].get());
+            out_ << "    sw t0, " << ((i - 8) * 4) << "(sp)\n";
+        }
         out_ << "    call " << call->func_name << "\n";
+        if (overflow > 0)
+            out_ << "    addi sp, sp, " << (overflow * 4) << "\n";
         out_ << "    mv t0, a0\n";
     }
 
