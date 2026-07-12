@@ -149,7 +149,7 @@ private:
                 out_ << "    sw " << arg_reg(i) << ", " << off << "(sp)\n";
             else {
                 // 栈参数：调用者存在 sp 负偏移，callee 用 stack_size_ - N 读取
-                int caller_off = stack_size_ - (i - 8 + 1) * 4;
+                int caller_off = stack_size_ - (i - 8 + 2) * 4;  // 对应调用者的 -8, -12, ...
                 out_ << "    lw t0, " << caller_off << "(sp)\n";
                 out_ << "    sw t0, " << off << "(sp)\n";
             }
@@ -316,7 +316,7 @@ private:
         // 溢出参数：存到 sp 负偏移（调用者栈下方，callee 会找到）
         for (int i = 8; i < n; i++) {
             gen_expr(call->args[i].get());
-            out_ << "    sw t0, -" << ((i - 8 + 1) * 4) << "(sp)\n";
+            out_ << "    sw t0, -" << ((i - 8 + 2) * 4) << "(sp)\n";  // -8, -12, ... 避开 ra 的 -4
         }
         out_ << "    call " << call->func_name << "\n";
         out_ << "    mv t0, a0\n";
