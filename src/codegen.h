@@ -55,9 +55,36 @@ private:
     const CompUnit& unit_;
     bool opt_;
     std::ostringstream out_;
-    std::unordered_map<std::string, int> symtab_;   // 变量 → 栈偏移
-    std::unordered_map<std::string, int> consts_;   // 常量 → 编译期值（v1.0）
+    // 栈式作用域：每个 Block 进入时 push 一个作用域，离开时 pop
+    std::vector<std::unordered_map<std::string, int>> symtab_{1};
+    std::vector<std::unordered_map<std::string, int>> consts_{1};  // v1.0
     int stack_size_ = 0, label_count_ = 0, extra_stack_ = 0, next_offset_ = 0;
+
+    void enter_scope() { symtab_.push_back({}); consts_.push_back({}); }
+    void exit_scope() { symtab_.pop_back(); consts_.pop_back(); }
+
+    int alloc_var(const std::string& name) {
+        int off = next_offset_; next_offset_ += 4;
+        symtab_.back()[name] = off;
+        return off;
+    }
+
+    // 从内到外查找变量
+    int* find_var(const std::string& name) {
+        for (int i = (int)symtab_.size() - 1; i >= 0; i--) {
+            auto it = symtab_[i].find(name);
+            if (it != symtab_[i].end()) return &it->second;
+        }
+        return nullptr;
+    }
+
+    int* find_const(const std::string& name) {
+        for (int i = (int)consts_.size() - 1; i >= 0; i--) {
+            auto it = consts_[i].find(name);
+            if (it != consts_[i].end()) return &it->second;
+        }
+        return nullptr;
+    }
     std::string current_func_;
     struct LoopLabels { int begin, end; };
     std::vector<LoopLabels> loops_;
@@ -71,18 +98,12 @@ private:
         return n;
     }
 
-    int alloc_var(const std::string& name) {
-        int off = next_offset_; next_offset_ += 4;
-        symtab_[name] = off;
-        return off;
-    }
-
     // ---- 函数 ----
 
     void gen_func(const FuncDef* func) {
         current_func_ = func->name;
-        symtab_.clear();
-        consts_.clear();
+        symtab_.clear(); symtab_.push_back({});
+        consts_.clear(); consts_.push_back({});
         extra_stack_ = 0;
         next_offset_ = 0;
 
@@ -100,7 +121,7 @@ private:
         out_ << "    sw ra, " << (stack_size_ - 4) << "(sp)\n";
 
         for (int i = 0; i < (int)func->params.size(); i++) {
-            int off = symtab_[func->params[i]];
+            int off = symtab_[0][func->params[i]];
             std::string r = (i == 0) ? "a0" : (i == 1) ? "a1" : "a2";
             out_ << "    sw " << r << ", " << off << "(sp)\n";
         }
@@ -114,7 +135,9 @@ private:
     }
 
     void gen_block(const Block* block) {
+        enter_scope();
         for (auto& s : block->stmts) gen_stmt(s.get());
+        exit_scope();
     }
 
     // ---- 语句 ----
@@ -125,7 +148,7 @@ private:
         // ConstDecl：编译期求值，存入常量表（v1.0）
         if (auto* cd = dynamic_cast<const ConstDecl*>(stmt)) {
             int val = eval_const(cd->init.get());
-            consts_[cd->name] = val;
+            consts_.back()[cd->name] = val;
             return;
         }
 
@@ -136,10 +159,10 @@ private:
             return;
         }
         if (auto* as = dynamic_cast<const AssignStmt*>(stmt)) {
-            auto it = symtab_.find(as->name);
-            if (it == symtab_.end()) throw std::runtime_error("undefined: " + as->name);
+            int* off = find_var(as->name);
+            if (!off) throw std::runtime_error("undefined: " + as->name);
             gen_expr(as->expr.get());
-            out_ << "    sw t0, " << it->second << "(sp)\n";
+            out_ << "    sw t0, " << *off << "(sp)\n";
             return;
         }
         if (auto* ret = dynamic_cast<const ReturnStmt*>(stmt)) {
@@ -206,25 +229,16 @@ private:
         }
         if (auto* id = dynamic_cast<const IdExpr*>(expr)) {
             // 查找顺序：常量 > 局部变量 > 全局变量
-            auto ci = consts_.find(id->name);
-            if (ci != consts_.end()) {
-                out_ << "    li t0, " << ci->second << "\n";
-                return;
-            }
-            auto it = symtab_.find(id->name);
-            if (it != symtab_.end()) {
-                out_ << "    lw t0, " << it->second << "(sp)\n";
-                return;
-            }
+            int* cv = find_const(id->name);
+            if (cv) { out_ << "    li t0, " << *cv << "\n"; return; }
+            int* off = find_var(id->name);
+            if (off) { out_ << "    lw t0, " << *off << "(sp)\n"; return; }
             auto gi = global_vars_.find(id->name);
             if (gi != global_vars_.end()) {
                 out_ << "    li t0, " << gi->second << "\n";
                 return;
             }
             throw std::runtime_error("undefined: " + id->name);
-            if (it == symtab_.end()) throw std::runtime_error("undefined: " + id->name);
-            out_ << "    lw t0, " << it->second << "(sp)\n";
-            return;
         }
         if (auto* bin = dynamic_cast<const BinaryExpr*>(expr)) {
             // 短路计算（v1.0）
@@ -294,8 +308,10 @@ private:
         if (auto* num = dynamic_cast<const NumberExpr*>(expr))
             return num->value;
         if (auto* id = dynamic_cast<const IdExpr*>(expr)) {
-            auto it = consts_.find(id->name);
-            if (it != consts_.end()) return it->second;
+            int* cv = find_const(id->name);
+            if (cv) return *cv;
+            auto gi = global_vars_.find(id->name);
+            if (gi != global_vars_.end()) return gi->second;
             throw std::runtime_error("const init requires compile-time value: " + id->name);
         }
         if (auto* bin = dynamic_cast<const BinaryExpr*>(expr)) {

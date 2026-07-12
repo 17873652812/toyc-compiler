@@ -23,25 +23,28 @@ public:
         auto unit = std::make_unique<CompUnit>();
         while (!is_end()) {
             // const int X = ...; → 全局常量
-            if (check(TokenKind::KW_CONST)) {
+            if (match(TokenKind::KW_CONST)) {
                 unit->globals.push_back(parse_const_decl());
+                continue;
             }
-            // int IDENT ( ... → 函数定义
-            // int IDENT = ... → 全局变量
-            else if (check(TokenKind::KW_INT)) {
+            // void ... → 函数定义
+            if (check(TokenKind::KW_VOID)) {
+                unit->funcs.push_back(parse_func_def());
+                continue;
+            }
+            // int ... → 需要区分函数定义和全局变量
+            if (check(TokenKind::KW_INT)) {
+                // int IDENT ( ... → 函数定义
                 if (lookahead(1) == TokenKind::IDENT && lookahead(2) == TokenKind::LPAREN) {
                     unit->funcs.push_back(parse_func_def());
                 } else {
+                    // int IDENT = ... → 全局变量
                     advance();  // 吃掉 int
                     unit->globals.push_back(parse_var_decl());
                 }
+                continue;
             }
-            else if (check(TokenKind::KW_VOID)) {
-                unit->funcs.push_back(parse_func_def());
-            }
-            else {
-                error("expected 'int', 'void', or 'const'");
-            }
+            error("expected 'int', 'void', or 'const'");
         }
         return unit;
     }
