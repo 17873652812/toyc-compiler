@@ -43,6 +43,14 @@ struct UnaryExpr : ASTNode {
         : op(std::move(o)), expr(std::move(e)) {}
 };
 
+// 函数调用：f(arg1, arg2, ...)（v0.5）
+struct CallExpr : ASTNode {
+    std::string func_name;
+    std::vector<std::unique_ptr<ASTNode>> args;
+    CallExpr(std::string f, std::vector<std::unique_ptr<ASTNode>> a)
+        : func_name(std::move(f)), args(std::move(a)) {}
+};
+
 // ---- 语句 ----
 
 // Block：花括号包着的多条语句 { ... }
@@ -50,10 +58,10 @@ struct Block : ASTNode {
     std::vector<std::unique_ptr<ASTNode>> stmts;
 };
 
-// return 语句：return expr;
+// return 语句：return expr; 或 return;（v0.5：expr 可为空表示 void return）
 struct ReturnStmt : ASTNode {
-    std::unique_ptr<ASTNode> expr;
-    explicit ReturnStmt(std::unique_ptr<ASTNode> e)
+    std::unique_ptr<ASTNode> expr;  // nullptr = void return
+    explicit ReturnStmt(std::unique_ptr<ASTNode> e = nullptr)
         : expr(std::move(e)) {}
 };
 
@@ -100,12 +108,16 @@ struct ContinueStmt : ASTNode {};
 
 // ---- 顶层 ----
 
-// 函数定义
+// 函数定义（v0.5：加入返回类型和参数列表）
 struct FuncDef : ASTNode {
+    std::string ret_type;           // "int" 或 "void"
     std::string name;
-    std::unique_ptr<Block> body;    // v0.2: body 变成 Block
-    FuncDef(std::string n, std::unique_ptr<Block> b)
-        : name(std::move(n)), body(std::move(b)) {}
+    std::vector<std::string> params; // 参数名列表
+    std::unique_ptr<Block> body;
+    FuncDef(std::string rt, std::string n,
+            std::vector<std::string> ps, std::unique_ptr<Block> b)
+        : ret_type(std::move(rt)), name(std::move(n)),
+          params(std::move(ps)), body(std::move(b)) {}
 };
 
 // 程序根节点

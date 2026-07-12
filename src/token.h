@@ -8,8 +8,8 @@ namespace toyc {
 
 enum class TokenKind {
     // 关键字
-    KW_INT,      KW_RETURN,   KW_IF,       KW_ELSE,
-    KW_WHILE,    KW_BREAK,    KW_CONTINUE,  // v0.4
+    KW_INT,      KW_VOID,     KW_RETURN,   KW_IF,       KW_ELSE,
+    KW_WHILE,    KW_BREAK,    KW_CONTINUE,  // v0.4-0.5
 
     // 标识符 & 字面量
     IDENT,       NUMBER,
@@ -37,6 +37,7 @@ struct Token {
     std::string kind_name() const {
         switch (kind) {
             case TokenKind::KW_INT:      return "KW_INT";
+            case TokenKind::KW_VOID:     return "KW_VOID";
             case TokenKind::KW_RETURN:   return "KW_RETURN";
             case TokenKind::KW_IF:       return "KW_IF";
             case TokenKind::KW_ELSE:     return "KW_ELSE";
@@ -73,6 +74,7 @@ struct Token {
 
 inline const std::unordered_map<std::string, TokenKind> keywords = {
     {"int",      TokenKind::KW_INT},
+    {"void",     TokenKind::KW_VOID},
     {"return",   TokenKind::KW_RETURN},
     {"if",       TokenKind::KW_IF},
     {"else",     TokenKind::KW_ELSE},

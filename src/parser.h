@@ -20,7 +20,8 @@ namespace toyc {
 //   AddExpr   → MulExpr (('+'|'-') MulExpr)*
 //   MulExpr   → UnaryExpr (('*'|'/'|'%') UnaryExpr)*
 //   UnaryExpr → ('+'|'-'|'!') UnaryExpr | PrimaryExpr
-//   PrimaryExpr→ IDENT | NUMBER | '(' Expr ')'
+//   PrimaryExpr→ IDENT | NUMBER | '(' Expr ')' | CallExpr
+//   CallExpr  → IDENT '(' (Expr (',' Expr)*)? ')'（v0.5）
 class Parser {
 public:
     explicit Parser(std::vector<Token> tokens)
@@ -29,10 +30,10 @@ public:
     std::unique_ptr<CompUnit> parse() {
         auto unit = std::make_unique<CompUnit>();
         while (!is_end()) {
-            if (match(TokenKind::KW_INT)) {
+            if (check(TokenKind::KW_INT) || check(TokenKind::KW_VOID)) {
                 unit->funcs.push_back(parse_func_def());
             } else {
-                error("expected 'int'");
+                error("expected 'int' or 'void'");
             }
         }
         return unit;
@@ -82,14 +83,33 @@ private:
 
     // ---- 语法规则 ----
 
-    // FuncDef → 'int' IDENT '(' ')' Block
-    // （'int' 已在 parse() 里 match 掉了）
+    // FuncDef → ('int'|'void') IDENT '(' (Param (',' Param)*)? ')' Block（v0.5）
+    // Param → 'int' IDENT
     std::unique_ptr<FuncDef> parse_func_def() {
+        // 返回类型
+        std::string ret_type;
+        if (match(TokenKind::KW_INT)) ret_type = "int";
+        else if (match(TokenKind::KW_VOID)) ret_type = "void";
+        else error("expected 'int' or 'void'");
+
         Token name_tok = expect(TokenKind::IDENT, "expected function name");
         expect(TokenKind::LPAREN, "expected '('");
+
+        // 参数列表（每个参数都是 int 类型）
+        std::vector<std::string> params;
+        if (!check(TokenKind::RPAREN)) {
+            expect(TokenKind::KW_INT, "expected 'int'");
+            Token p = expect(TokenKind::IDENT, "expected parameter name");
+            params.push_back(p.lexeme);
+            while (match(TokenKind::COMMA)) {
+                expect(TokenKind::KW_INT, "expected 'int'");
+                Token p2 = expect(TokenKind::IDENT, "expected parameter name");
+                params.push_back(p2.lexeme);
+            }
+        }
         expect(TokenKind::RPAREN, "expected ')'");
         auto body = parse_block();
-        return std::make_unique<FuncDef>(name_tok.lexeme, std::move(body));
+        return std::make_unique<FuncDef>(ret_type, name_tok.lexeme, params, std::move(body));
     }
 
     // Block → '{' Stmt* '}'
@@ -109,6 +129,8 @@ private:
             return parse_var_decl();
         }
         if (match(TokenKind::KW_RETURN)) {
+            if (match(TokenKind::SEMICOLON))
+                return std::make_unique<ReturnStmt>();  // void return
             auto expr = parse_expr();
             expect(TokenKind::SEMICOLON, "expected ';'");
             return std::make_unique<ReturnStmt>(std::move(expr));
@@ -131,9 +153,29 @@ private:
             return parse_block();
         }
         if (check(TokenKind::IDENT)) {
-            return parse_assign_stmt();
+            return parse_assign_or_call_stmt();
         }
         error("expected statement");
+        return nullptr;
+    }
+
+    // AssignStmt → IDENT '=' Expr ';'  或  CallExpr ';'（v0.5）
+    std::unique_ptr<ASTNode> parse_assign_or_call_stmt() {
+        Token name_tok = advance();  // 吃掉 IDENT
+        if (match(TokenKind::ASSIGN)) {
+            auto expr = parse_expr();
+            expect(TokenKind::SEMICOLON, "expected ';'");
+            return std::make_unique<AssignStmt>(name_tok.lexeme, std::move(expr));
+        }
+        if (check(TokenKind::LPAREN)) {
+            // 函数调用作为语句：f(args);
+            // 回退 IDENT，用 parse_primary_expr 里的函数调用逻辑
+            pos_--;
+            auto expr = parse_expr();
+            expect(TokenKind::SEMICOLON, "expected ';'");
+            return expr;  // CallExpr 直接当语句
+        }
+        error("expected '=' or '('");
         return nullptr;
     }
 
@@ -237,14 +279,27 @@ private:
         return parse_primary_expr();
     }
 
-    // PrimaryExpr → IDENT | NUMBER | '(' Expr ')'
+    // PrimaryExpr → IDENT ('(' args ')')? | NUMBER | '(' Expr ')'（v0.5：函数调用）
     std::unique_ptr<ASTNode> parse_primary_expr() {
         if (match(TokenKind::NUMBER)) {
             int val = std::stoi(tokens_[pos_ - 1].lexeme);
             return std::make_unique<NumberExpr>(val);
         }
         if (match(TokenKind::IDENT)) {
-            return std::make_unique<IdExpr>(tokens_[pos_ - 1].lexeme);
+            std::string name = tokens_[pos_ - 1].lexeme;
+            // 如果后面跟 '('，就是函数调用
+            if (match(TokenKind::LPAREN)) {
+                std::vector<std::unique_ptr<ASTNode>> args;
+                if (!check(TokenKind::RPAREN)) {
+                    args.push_back(parse_expr());
+                    while (match(TokenKind::COMMA)) {
+                        args.push_back(parse_expr());
+                    }
+                }
+                expect(TokenKind::RPAREN, "expected ')'");
+                return std::make_unique<CallExpr>(name, std::move(args));
+            }
+            return std::make_unique<IdExpr>(name);
         }
         if (match(TokenKind::LPAREN)) {
             auto expr = parse_expr();
