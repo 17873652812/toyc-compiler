@@ -48,7 +48,11 @@
       "Bash(git push *)",
       "Bash(git rm *)",
       "Bash(git branch *)",
-      "Bash(echo '// this is a comment *)"
+      "Bash(echo '// this is a comment *)",
+      "Bash(git ls-remote *)",
+      "Bash(git clone *)",
+      "Read(//tmp/**)",
+      "Bash(rm -rf /tmp/test-clone)"
     ]
   }
 }
