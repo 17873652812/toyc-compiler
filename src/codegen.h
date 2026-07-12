@@ -90,6 +90,7 @@ private:
     std::vector<LoopLabels> loops_;
 
     int new_label() { return label_count_++; }
+    std::string arg_reg(int i) { return "a" + std::to_string(i); }  // v1.0: a0-a7
 
     int count_vars(const Block* block) {
         int n = 0;
@@ -121,12 +122,12 @@ private:
         out_ << "    sw ra, " << (stack_size_ - 4) << "(sp)\n";
 
         for (int i = 0; i < (int)func->params.size(); i++) {
-            int off = symtab_[0][func->params[i]];
-            std::string r = (i == 0) ? "a0" : (i == 1) ? "a1" : "a2";
-            out_ << "    sw " << r << ", " << off << "(sp)\n";
+            int off = symtab_.back()[func->params[i]];
+            out_ << "    sw " << arg_reg(i) << ", " << off << "(sp)\n";
         }
 
-        gen_block(func->body.get());
+        // 函数体直接遍历，不通过 gen_block（避免重复 enter_scope）
+        for (auto& s : func->body->stmts) gen_stmt(s.get());
 
         out_ << ".L" << func->name << "_exit:\n";
         out_ << "    lw ra, " << (stack_size_ - 4) << "(sp)\n";
@@ -267,8 +268,7 @@ private:
         int n = (int)call->args.size();
         for (int i = 0; i < n; i++) {
             gen_expr(call->args[i].get());
-            std::string r = (i == 0) ? "a0" : (i == 1) ? "a1" : "a2";
-            out_ << "    mv " << r << ", t0\n";
+            out_ << "    mv " << arg_reg(i) << ", t0\n";
         }
         out_ << "    call " << call->func_name << "\n";
         out_ << "    mv t0, a0\n";
