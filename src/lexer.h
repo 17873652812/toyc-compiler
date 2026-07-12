@@ -47,14 +47,32 @@ private:
     // 获取当前行列号
     Position current_pos() const { return Position{line_, col_}; }
 
-    // 跳过空格、Tab、换行
+    // 跳过空格、Tab、换行、注释
     void skip_whitespace() {
         while (pos_ < source_.size()) {
             char c = peek();
-            if (c == ' ' || c == '\t' || c == '\n' || c == '\r')
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
                 advance();
-            else
-                break;
+            }
+            // 单行注释 //
+            else if (c == '/' && pos_ + 1 < source_.size()
+                     && source_[pos_ + 1] == '/') {
+                while (peek() != '\n' && peek() != '\0') advance();
+            }
+            // 多行注释 /* */
+            else if (c == '/' && pos_ + 1 < source_.size()
+                     && source_[pos_ + 1] == '*') {
+                advance(); advance();  // 跳过 /*
+                while (pos_ < source_.size()) {
+                    if (peek() == '*' && pos_ + 1 < source_.size()
+                        && source_[pos_ + 1] == '/') {
+                        advance(); advance();  // 跳过 */
+                        break;
+                    }
+                    advance();
+                }
+            }
+            else break;
         }
     }
 

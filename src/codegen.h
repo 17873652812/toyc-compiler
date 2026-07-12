@@ -174,6 +174,16 @@ private:
             loops_.pop_back();
             return;
         }
+        // 裸表达式语句：x;  5;  (a+b); — 求值后丢弃结果
+        if (dynamic_cast<const NumberExpr*>(stmt)
+            || dynamic_cast<const IdExpr*>(stmt)
+            || dynamic_cast<const BinaryExpr*>(stmt)
+            || dynamic_cast<const UnaryExpr*>(stmt)
+            || dynamic_cast<const CallExpr*>(stmt)) {
+            gen_expr(stmt);  // 求值，结果在 t0，不需要用
+            return;
+        }
+
         if (dynamic_cast<const BreakStmt*>(stmt)) {
             if (loops_.empty()) throw std::runtime_error("break outside loop");
             out_ << "    j .L" << loops_.back().end << "\n";

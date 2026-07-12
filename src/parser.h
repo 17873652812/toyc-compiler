@@ -144,6 +144,14 @@ private:
         }
         if (check(TokenKind::LBRACE)) return parse_block();
         if (check(TokenKind::IDENT)) return parse_assign_or_call_stmt();
+        // 其他表达式语句：NUMBER;  (Expr);  +Expr; 等
+        if (check(TokenKind::NUMBER) || check(TokenKind::LPAREN)
+            || check(TokenKind::PLUS) || check(TokenKind::MINUS)
+            || check(TokenKind::NOT)) {
+            auto expr = parse_expr();
+            expect(TokenKind::SEMICOLON, "expected ';'");
+            return expr;  // ExprStmt: 表达式结果丢弃
+        }
         error("expected statement");
         return nullptr;
     }
@@ -161,8 +169,10 @@ private:
             expect(TokenKind::SEMICOLON, "expected ';'");
             return expr;
         }
-        error("expected '=' or '('");
-        return nullptr;
+        // 都不是：裸标识符表达式 "x;"
+        auto expr = std::make_unique<IdExpr>(name_tok.lexeme);
+        expect(TokenKind::SEMICOLON, "expected ';'");
+        return expr;
     }
 
     std::unique_ptr<VarDecl> parse_var_decl() {
