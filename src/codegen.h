@@ -9,43 +9,45 @@ namespace toyc {
 
 class Codegen {
 public:
-    explicit Codegen(const CompUnit& unit) : unit_(unit) {}
+    explicit Codegen(const CompUnit& unit, bool opt = false)
+        : unit_(unit), opt_(opt) {}
 
     std::string generate() {
         out_ << ".text\n";
-
-        // _start：程序入口，调用 main，然后 exit（v0.5）
-        out_ << ".globl _start\n";
-        out_ << "_start:\n";
+        out_ << ".globl _start\n_start:\n";
         out_ << "    call main\n";
         out_ << "    li a7, 93\n";
         out_ << "    ecall\n\n";
 
-        for (const auto& func : unit_.funcs) {
+        for (const auto& func : unit_.funcs)
             gen_func(func.get());
-        }
         return out_.str();
     }
 
 private:
     const CompUnit& unit_;
+    bool opt_;
     std::ostringstream out_;
-    std::unordered_map<std::string, int> symtab_;
-    int stack_size_ = 0;
-    int label_count_ = 0;
-    int new_label() { return label_count_++; }
+    std::unordered_map<std::string, int> symtab_;   // 变量 → 栈偏移
+    std::unordered_map<std::string, int> consts_;   // 常量 → 编译期值（v1.0）
+    int stack_size_ = 0, label_count_ = 0, extra_stack_ = 0, next_offset_ = 0;
+    std::string current_func_;
     struct LoopLabels { int begin, end; };
     std::vector<LoopLabels> loops_;
-    std::string current_func_;  // 当前函数名（判断是否是 main）
-    int extra_stack_ = 0;
 
-    // 统计局部变量数（不含参数，参数用单独的 slot）
+    int new_label() { return label_count_++; }
+
     int count_vars(const Block* block) {
         int n = 0;
-        for (const auto& stmt : block->stmts) {
+        for (const auto& stmt : block->stmts)
             if (dynamic_cast<const VarDecl*>(stmt.get())) n++;
-        }
         return n;
+    }
+
+    int alloc_var(const std::string& name) {
+        int off = next_offset_; next_offset_ += 4;
+        symtab_[name] = off;
+        return off;
     }
 
     // ---- 函数 ----
@@ -53,130 +55,98 @@ private:
     void gen_func(const FuncDef* func) {
         current_func_ = func->name;
         symtab_.clear();
+        consts_.clear();
         extra_stack_ = 0;
         next_offset_ = 0;
 
-        // 参数：从 a0, a1... 存入栈（每个参数一个 slot）
-        int param_count = (int)func->params.size();
-        for (int i = 0; i < param_count; i++) {
-            alloc_var(func->params[i]);  // 分配栈 slot
-        }
-        // 局部变量
+        // 参数 slot
+        for (auto& p : func->params) alloc_var(p);
         int nvars = count_vars(func->body.get());
-        // 暂时预留（在 gen_stmt VarDecl 里分配），但我们需要提前知道总数
-        // 简单做法：不做预留，在 VarDecl 时动态分配
-        // 重置 next_offset_，让 VarDecl 接着 params 后面分配
-        // （next_offset_ 已经指向 params 之后）
-
-        // 计算栈帧大小：变量 + ra 保存位，对齐到 16
-        int total_vars = param_count + nvars;
-        int frame_size = total_vars * 4 + 4;  // +4 是 ra 位
-        if (frame_size < 16) frame_size = 16;        // 最小 16
-        frame_size = (frame_size + 15) & ~15;         // 16 对齐
+        int total_vars = (int)func->params.size() + nvars;
+        int frame_size = total_vars * 4 + 4;
+        if (frame_size < 16) frame_size = 16;
+        frame_size = (frame_size + 15) & ~15;
         stack_size_ = frame_size;
 
-        out_ << ".globl " << func->name << "\n";
-        out_ << func->name << ":\n";
-
-        // 序言：分配栈空间 + 保存 ra
+        out_ << ".globl " << func->name << "\n" << func->name << ":\n";
         out_ << "    addi sp, sp, -" << stack_size_ << "\n";
         out_ << "    sw ra, " << (stack_size_ - 4) << "(sp)\n";
 
-        // 把参数从 a0, a1... 复制到栈上
-        for (int i = 0; i < param_count; i++) {
+        for (int i = 0; i < (int)func->params.size(); i++) {
             int off = symtab_[func->params[i]];
-            std::string areg = (i == 0) ? "a0" : (i == 1) ? "a1" : "a2";
-            out_ << "    sw " << areg << ", " << off << "(sp)\n";
+            std::string r = (i == 0) ? "a0" : (i == 1) ? "a1" : "a2";
+            out_ << "    sw " << r << ", " << off << "(sp)\n";
         }
 
         gen_block(func->body.get());
 
-        // 尾声（所有 return 跳到这里）
         out_ << ".L" << func->name << "_exit:\n";
         out_ << "    lw ra, " << (stack_size_ - 4) << "(sp)\n";
         out_ << "    addi sp, sp, " << stack_size_ << "\n";
         out_ << "    ret\n\n";
     }
 
-    int next_offset_ = 0;
-    int alloc_var(const std::string& name) {
-        int offset = next_offset_;
-        next_offset_ += 4;
-        symtab_[name] = offset;
-        return offset;
-    }
-
-    // ---- Block ----
-
     void gen_block(const Block* block) {
-        for (const auto& stmt : block->stmts)
-            gen_stmt(stmt.get());
+        for (auto& s : block->stmts) gen_stmt(s.get());
     }
 
     // ---- 语句 ----
 
     void gen_stmt(const ASTNode* stmt) {
-        if (auto* blk = dynamic_cast<const Block*>(stmt)) {
-            gen_block(blk); return;
+        if (auto* b = dynamic_cast<const Block*>(stmt)) { gen_block(b); return; }
+
+        // ConstDecl：编译期求值，存入常量表（v1.0）
+        if (auto* cd = dynamic_cast<const ConstDecl*>(stmt)) {
+            int val = eval_const(cd->init.get());
+            consts_[cd->name] = val;
+            return;
         }
+
         if (auto* vd = dynamic_cast<const VarDecl*>(stmt)) {
             gen_expr(vd->init.get());
-            int offset = alloc_var(vd->name);
-            out_ << "    sw t0, " << offset << "(sp)\n";
+            int off = alloc_var(vd->name);
+            out_ << "    sw t0, " << off << "(sp)\n";
             return;
         }
         if (auto* as = dynamic_cast<const AssignStmt*>(stmt)) {
-            gen_expr(as->expr.get());
             auto it = symtab_.find(as->name);
-            if (it == symtab_.end())
-                throw std::runtime_error("undefined: " + as->name);
+            if (it == symtab_.end()) throw std::runtime_error("undefined: " + as->name);
+            gen_expr(as->expr.get());
             out_ << "    sw t0, " << it->second << "(sp)\n";
             return;
         }
         if (auto* ret = dynamic_cast<const ReturnStmt*>(stmt)) {
-            if (ret->expr) {
-                gen_expr(ret->expr.get());
-                out_ << "    mv a0, t0\n";
-            }
-            // 跳到尾声（共用 ra 恢复 + ret）
+            if (ret->expr) { gen_expr(ret->expr.get()); out_ << "    mv a0, t0\n"; }
             out_ << "    j .L" << current_func_ << "_exit\n";
             return;
         }
+        if (auto* call = dynamic_cast<const CallExpr*>(stmt)) {
+            gen_call(call);
+            return;
+        }
         if (auto* ifs = dynamic_cast<const IfStmt*>(stmt)) {
-            int else_lbl = new_label(), end_lbl = new_label();
+            int el = new_label(), en = new_label();
             gen_expr(ifs->cond.get());
-            out_ << "    beqz t0, .L" << else_lbl << "\n";
+            out_ << "    beqz t0, .L" << el << "\n";
             gen_stmt(ifs->then_stmt.get());
-            out_ << "    j .L" << end_lbl << "\n";
-            out_ << ".L" << else_lbl << ":\n";
+            out_ << "    j .L" << en << "\n";
+            out_ << ".L" << el << ":\n";
             if (ifs->else_stmt) gen_stmt(ifs->else_stmt.get());
-            out_ << ".L" << end_lbl << ":\n";
+            out_ << ".L" << en << ":\n";
             return;
         }
         if (auto* ws = dynamic_cast<const WhileStmt*>(stmt)) {
-            int begin_lbl = new_label(), end_lbl = new_label();
-            loops_.push_back({begin_lbl, end_lbl});
-            out_ << ".L" << begin_lbl << ":\n";
+            int bg = new_label(), en = new_label();
+            loops_.push_back({bg, en});
+            out_ << ".L" << bg << ":\n";
             gen_expr(ws->cond.get());
-            out_ << "    beqz t0, .L" << end_lbl << "\n";
+            out_ << "    beqz t0, .L" << en << "\n";
             gen_stmt(ws->body.get());
-            out_ << "    j .L" << begin_lbl << "\n";
-            out_ << ".L" << end_lbl << ":\n";
+            out_ << "    j .L" << bg << "\n";
+            out_ << ".L" << en << ":\n";
             loops_.pop_back();
             return;
         }
-        // CallExpr 作为语句：f(args);（v0.5）
-        if (auto* call = dynamic_cast<const CallExpr*>(stmt)) {
-            int nargs = (int)call->args.size();
-            for (int i = 0; i < nargs; i++) {
-                gen_expr(call->args[i].get());
-                std::string areg = (i == 0) ? "a0" : (i == 1) ? "a1" : "a2";
-                out_ << "    mv " << areg << ", t0\n";
-            }
-            out_ << "    call " << call->func_name << "\n";
-            return;
-        }
-
         if (dynamic_cast<const BreakStmt*>(stmt)) {
             if (loops_.empty()) throw std::runtime_error("break outside loop");
             out_ << "    j .L" << loops_.back().end << "\n";
@@ -198,13 +168,22 @@ private:
             return;
         }
         if (auto* id = dynamic_cast<const IdExpr*>(expr)) {
+            // 先查常量表（v1.0）
+            auto ci = consts_.find(id->name);
+            if (ci != consts_.end()) {
+                out_ << "    li t0, " << ci->second << "\n";
+                return;
+            }
             auto it = symtab_.find(id->name);
-            if (it == symtab_.end())
-                throw std::runtime_error("undefined: " + id->name);
+            if (it == symtab_.end()) throw std::runtime_error("undefined: " + id->name);
             out_ << "    lw t0, " << it->second << "(sp)\n";
             return;
         }
         if (auto* bin = dynamic_cast<const BinaryExpr*>(expr)) {
+            // 短路计算（v1.0）
+            if (bin->op == "&&") { gen_short_circuit_and(bin); return; }
+            if (bin->op == "||") { gen_short_circuit_or(bin); return; }
+            // 普通二元运算
             gen_expr(bin->left.get());
             push_t0();
             gen_expr(bin->right.get());
@@ -213,27 +192,86 @@ private:
             return;
         }
         if (auto* un = dynamic_cast<const UnaryExpr*>(expr)) {
-            gen_expr(un->expr.get());
-            gen_un_op(un->op);
-            return;
+            gen_expr(un->expr.get()); gen_un_op(un->op); return;
         }
-        // CallExpr：函数调用（v0.5）
         if (auto* call = dynamic_cast<const CallExpr*>(expr)) {
-            // 计算参数，逐个放入 a0, a1...
-            int nargs = (int)call->args.size();
-            for (int i = 0; i < nargs; i++) {
-                gen_expr(call->args[i].get());
-                std::string areg = (i == 0) ? "a0" : (i == 1) ? "a1" : "a2";
-                out_ << "    mv " << areg << ", t0\n";
-            }
-            out_ << "    call " << call->func_name << "\n";
-            out_ << "    mv t0, a0\n";  // 返回值 → t0
-            return;
+            gen_call(call); return;
         }
         throw std::runtime_error("Codegen: unknown expression");
     }
 
-    // ---- 临时栈 push/pop（不改 sp） ----
+    // ---- 函数调用 ----
+
+    void gen_call(const CallExpr* call) {
+        int n = (int)call->args.size();
+        for (int i = 0; i < n; i++) {
+            gen_expr(call->args[i].get());
+            std::string r = (i == 0) ? "a0" : (i == 1) ? "a1" : "a2";
+            out_ << "    mv " << r << ", t0\n";
+        }
+        out_ << "    call " << call->func_name << "\n";
+        out_ << "    mv t0, a0\n";
+    }
+
+    // ---- 短路计算（v1.0） ----
+
+    void gen_short_circuit_and(const BinaryExpr* bin) {
+        int end_lbl = new_label(), false_lbl = new_label();
+        gen_expr(bin->left.get());
+        out_ << "    beqz t0, .L" << false_lbl << "\n";   // 左假 → 短路
+        gen_expr(bin->right.get());
+        out_ << "    beqz t0, .L" << false_lbl << "\n";   // 右假 → 短路
+        out_ << "    li t0, 1\n";                           // 都为真 → 1
+        out_ << "    j .L" << end_lbl << "\n";
+        out_ << ".L" << false_lbl << ":\n";
+        out_ << "    li t0, 0\n";
+        out_ << ".L" << end_lbl << ":\n";
+    }
+
+    void gen_short_circuit_or(const BinaryExpr* bin) {
+        int end_lbl = new_label(), true_lbl = new_label();
+        gen_expr(bin->left.get());
+        out_ << "    bnez t0, .L" << true_lbl << "\n";     // 左真 → 短路
+        gen_expr(bin->right.get());
+        out_ << "    bnez t0, .L" << true_lbl << "\n";     // 右真 → 短路
+        out_ << "    li t0, 0\n";                           // 都为假 → 0
+        out_ << "    j .L" << end_lbl << "\n";
+        out_ << ".L" << true_lbl << ":\n";
+        out_ << "    li t0, 1\n";
+        out_ << ".L" << end_lbl << ":\n";
+    }
+
+    // ---- 编译期常量求值（v1.0） ----
+
+    int eval_const(const ASTNode* expr) {
+        if (auto* num = dynamic_cast<const NumberExpr*>(expr))
+            return num->value;
+        if (auto* id = dynamic_cast<const IdExpr*>(expr)) {
+            auto it = consts_.find(id->name);
+            if (it != consts_.end()) return it->second;
+            throw std::runtime_error("const init requires compile-time value: " + id->name);
+        }
+        if (auto* bin = dynamic_cast<const BinaryExpr*>(expr)) {
+            int l = eval_const(bin->left.get());
+            int r = eval_const(bin->right.get());
+            std::string op = bin->op;
+            if (op == "+") return l + r;
+            if (op == "-") return l - r;
+            if (op == "*") return l * r;
+            if (op == "/") return l / r;
+            if (op == "%") return l % r;
+            throw std::runtime_error("unsupported op in const: " + op);
+        }
+        if (auto* un = dynamic_cast<const UnaryExpr*>(expr)) {
+            int v = eval_const(un->expr.get());
+            if (un->op == "-") return -v;
+            if (un->op == "!") return !v;
+            return v;
+        }
+        throw std::runtime_error("non-const expression in const init");
+    }
+
+    // ---- 临时栈 ----
 
     void push_t0() {
         extra_stack_ += 4;
@@ -247,13 +285,13 @@ private:
     // ---- 运算 ----
 
     void gen_bin_op(const std::string& op) {
-        if (op == "+")      out_ << "    add t0, t1, t0\n";
+        if (op == "+") out_ << "    add t0, t1, t0\n";
         else if (op == "-") out_ << "    sub t0, t1, t0\n";
         else if (op == "*") out_ << "    mul t0, t1, t0\n";
         else if (op == "/") out_ << "    div t0, t1, t0\n";
         else if (op == "%") out_ << "    rem t0, t1, t0\n";
-        else if (op == "<")  out_ << "    slt t0, t1, t0\n";
-        else if (op == ">")  out_ << "    slt t0, t0, t1\n";
+        else if (op == "<") out_ << "    slt t0, t1, t0\n";
+        else if (op == ">") out_ << "    slt t0, t0, t1\n";
         else if (op == "<=") { out_ << "    slt t0, t0, t1\n    xori t0, t0, 1\n"; }
         else if (op == ">=") { out_ << "    slt t0, t1, t0\n    xori t0, t0, 1\n"; }
         else if (op == "==") { out_ << "    sub t0, t1, t0\n    seqz t0, t0\n"; }
@@ -262,7 +300,7 @@ private:
     }
 
     void gen_un_op(const std::string& op) {
-        if (op == "-")      out_ << "    neg t0, t0\n";
+        if (op == "-") out_ << "    neg t0, t0\n";
         else if (op == "!") out_ << "    seqz t0, t0\n";
         else if (op == "+") { /* nop */ }
         else throw std::runtime_error("unknown unop: " + op);

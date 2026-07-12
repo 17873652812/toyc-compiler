@@ -115,6 +115,13 @@ private:
             case '>':
                 if (peek() == '=') { advance(); return make(TokenKind::GE, ">=", p); }
                 return make(TokenKind::GT, ">", p);
+            // 双字符逻辑运算符（v1.0）
+            case '&':
+                if (peek() == '&') { advance(); return make(TokenKind::AND, "&&", p); }
+                return make(TokenKind::ERR, "&", p);
+            case '|':
+                if (peek() == '|') { advance(); return make(TokenKind::OR, "||", p); }
+                return make(TokenKind::ERR, "|", p);
             default:  return make(TokenKind::ERR, std::string(1, c), p);
         }
     }

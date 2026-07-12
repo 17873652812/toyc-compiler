@@ -68,8 +68,16 @@ struct ReturnStmt : ASTNode {
 // 变量声明：int x = expr;
 struct VarDecl : ASTNode {
     std::string name;
-    std::unique_ptr<ASTNode> init;   // 初始值表达式
+    std::unique_ptr<ASTNode> init;
     VarDecl(std::string n, std::unique_ptr<ASTNode> i)
+        : name(std::move(n)), init(std::move(i)) {}
+};
+
+// 常量声明：const int x = expr;（v1.0）
+struct ConstDecl : ASTNode {
+    std::string name;
+    std::unique_ptr<ASTNode> init;
+    ConstDecl(std::string n, std::unique_ptr<ASTNode> i)
         : name(std::move(n)), init(std::move(i)) {}
 };
 

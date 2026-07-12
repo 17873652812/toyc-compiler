@@ -8,8 +8,8 @@ namespace toyc {
 
 enum class TokenKind {
     // 关键字
-    KW_INT,      KW_VOID,     KW_RETURN,   KW_IF,       KW_ELSE,
-    KW_WHILE,    KW_BREAK,    KW_CONTINUE,  // v0.4-0.5
+    KW_INT,      KW_VOID,     KW_CONST,    KW_RETURN,   KW_IF,
+    KW_ELSE,     KW_WHILE,    KW_BREAK,    KW_CONTINUE,
 
     // 标识符 & 字面量
     IDENT,       NUMBER,
@@ -17,8 +17,11 @@ enum class TokenKind {
     // 运算符
     PLUS, MINUS, STAR, SLASH, PERCENT, ASSIGN, NOT, COMMA,
 
-    // 比较运算符
+    // 比较运算符（v0.3）
     LT, GT, LE, GE, EQ, NE,
+
+    // 逻辑运算符（v1.0）
+    AND, OR,      // &&  ||
 
     // 界符
     LPAREN, RPAREN, LBRACE, RBRACE, SEMICOLON,
@@ -39,6 +42,7 @@ struct Token {
             case TokenKind::KW_INT:      return "KW_INT";
             case TokenKind::KW_VOID:     return "KW_VOID";
             case TokenKind::KW_RETURN:   return "KW_RETURN";
+            case TokenKind::KW_CONST:    return "KW_CONST";
             case TokenKind::KW_IF:       return "KW_IF";
             case TokenKind::KW_ELSE:     return "KW_ELSE";
             case TokenKind::KW_WHILE:    return "KW_WHILE";
@@ -60,6 +64,8 @@ struct Token {
             case TokenKind::GE:          return "GE";
             case TokenKind::EQ:          return "EQ";
             case TokenKind::NE:          return "NE";
+            case TokenKind::AND:         return "AND";
+            case TokenKind::OR:          return "OR";
             case TokenKind::LPAREN:      return "LPAREN";
             case TokenKind::RPAREN:      return "RPAREN";
             case TokenKind::LBRACE:      return "LBRACE";
@@ -75,6 +81,7 @@ struct Token {
 inline const std::unordered_map<std::string, TokenKind> keywords = {
     {"int",      TokenKind::KW_INT},
     {"void",     TokenKind::KW_VOID},
+    {"const",    TokenKind::KW_CONST},
     {"return",   TokenKind::KW_RETURN},
     {"if",       TokenKind::KW_IF},
     {"else",     TokenKind::KW_ELSE},
