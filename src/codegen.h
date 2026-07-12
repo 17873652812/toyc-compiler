@@ -90,7 +90,11 @@ private:
     std::vector<LoopLabels> loops_;
 
     int new_label() { return label_count_++; }
-    std::string arg_reg(int i) { return "a" + std::to_string(i); }  // v1.0: a0-a7
+    // RISC-V 只有 a0-a7 共 8 个参数寄存器。超出部分需要栈传参
+    std::string arg_reg(int i) {
+        if (i < 8) return "a" + std::to_string(i);
+        return "";  // 栈传参，不返回寄存器名
+    }
 
     int count_vars(const Block* block) {
         int n = 0;
@@ -121,7 +125,9 @@ private:
         out_ << "    addi sp, sp, -" << stack_size_ << "\n";
         out_ << "    sw ra, " << (stack_size_ - 4) << "(sp)\n";
 
-        for (int i = 0; i < (int)func->params.size(); i++) {
+        // 只保存前 8 个寄存器参数（a0-a7），超出部分暂不支持
+        int nparams = std::min((int)func->params.size(), 8);
+        for (int i = 0; i < nparams; i++) {
             int off = symtab_.back()[func->params[i]];
             out_ << "    sw " << arg_reg(i) << ", " << off << "(sp)\n";
         }
@@ -265,7 +271,7 @@ private:
     // ---- 函数调用 ----
 
     void gen_call(const CallExpr* call) {
-        int n = (int)call->args.size();
+        int n = std::min((int)call->args.size(), 8);  // 最多 8 个寄存器参数
         for (int i = 0; i < n; i++) {
             gen_expr(call->args[i].get());
             out_ << "    mv " << arg_reg(i) << ", t0\n";
