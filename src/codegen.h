@@ -33,6 +33,9 @@ private:
     std::unordered_map<std::string, int> symtab_;
     int stack_size_ = 0;   // 当前函数总共用了多少栈空间
 
+    int label_count_ = 0;
+    int new_label() { return label_count_++; }
+
     // 统计 Block 里有多少个 VarDecl
     int count_vars(const Block* block) {
         int n = 0;
@@ -80,6 +83,11 @@ private:
     // ---- 语句 ----
 
     void gen_stmt(const ASTNode* stmt) {
+        // Block：{ stmt* }（递归调用 gen_block）
+        if (auto* blk = dynamic_cast<const Block*>(stmt)) {
+            gen_block(blk);
+            return;
+        }
         // VarDecl：int x = expr;
         if (auto* vd = dynamic_cast<const VarDecl*>(stmt)) {
             gen_expr(vd->init.get());       // 计算初始值 → t0
@@ -104,6 +112,26 @@ private:
             out_ << "    mv a0, t0\n";      // 把结果放到 a0（返回值寄存器）
             out_ << "    li a7, 93\n";      // exit 系统调用号
             out_ << "    ecall\n";          // 执行系统调用
+            return;
+        }
+
+        // IfStmt：if (cond) then [else else_stmt]（v0.3）
+        if (auto* ifs = dynamic_cast<const IfStmt*>(stmt)) {
+            int else_lbl = new_label();
+            int end_lbl = new_label();
+
+            gen_expr(ifs->cond.get());          // 计算条件 → t0
+            out_ << "    beqz t0, .L" << else_lbl << "\n";  // t0==0 跳 else
+
+            gen_stmt(ifs->then_stmt.get());     // then 分支
+            out_ << "    j .L" << end_lbl << "\n";           // 跳到结束
+
+            out_ << ".L" << else_lbl << ":\n";  // else 标签
+            if (ifs->else_stmt) {
+                gen_stmt(ifs->else_stmt.get());
+            }
+
+            out_ << ".L" << end_lbl << ":\n";   // 结束标签
             return;
         }
 
@@ -178,11 +206,31 @@ private:
     // ---- 运算 ----
 
     void gen_bin_op(const std::string& op) {
+        // 算术
         if (op == "+")      out_ << "    add t0, t1, t0\n";
         else if (op == "-") out_ << "    sub t0, t1, t0\n";
         else if (op == "*") out_ << "    mul t0, t1, t0\n";
         else if (op == "/") out_ << "    div t0, t1, t0\n";
         else if (op == "%") out_ << "    rem t0, t1, t0\n";
+        // 比较（v0.3）: 结果 t0 = (t1 op t0) ? 1 : 0
+        else if (op == "<")  out_ << "    slt t0, t1, t0\n";
+        else if (op == ">")  out_ << "    slt t0, t0, t1\n";
+        else if (op == "<=") {
+            out_ << "    slt t0, t0, t1\n";
+            out_ << "    xori t0, t0, 1\n";
+        }
+        else if (op == ">=") {
+            out_ << "    slt t0, t1, t0\n";
+            out_ << "    xori t0, t0, 1\n";
+        }
+        else if (op == "==") {
+            out_ << "    sub t0, t1, t0\n";
+            out_ << "    seqz t0, t0\n";
+        }
+        else if (op == "!=") {
+            out_ << "    sub t0, t1, t0\n";
+            out_ << "    snez t0, t0\n";
+        }
         else throw std::runtime_error("unknown binary operator: " + op);
     }
 

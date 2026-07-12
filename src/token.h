@@ -6,17 +6,18 @@
 
 namespace toyc {
 
-// Token 的类型
 enum class TokenKind {
     // 关键字
     KW_INT,      // int
     KW_RETURN,   // return
+    KW_IF,       // if     (v0.3)
+    KW_ELSE,     // else   (v0.3)
 
     // 标识符 & 字面量
     IDENT,       // 名字
     NUMBER,      // 数字
 
-    // 运算符（v0.2 新增）
+    // 运算符
     PLUS,        // +
     MINUS,       // -
     STAR,        // *
@@ -26,6 +27,14 @@ enum class TokenKind {
     NOT,         // !
     COMMA,       // ,
 
+    // 比较运算符（v0.3）
+    LT,          // <
+    GT,          // >
+    LE,          // <=
+    GE,          // >=
+    EQ,          // ==
+    NE,          // !=
+
     // 界符
     LPAREN,      // (
     RPAREN,      // )
@@ -33,7 +42,6 @@ enum class TokenKind {
     RBRACE,      // }
     SEMICOLON,   // ;
 
-    // 特殊
     END,         // 文件结束
     ERR,         // 非法字符
 };
@@ -46,11 +54,12 @@ struct Token {
     Token(TokenKind k, std::string lex, Position p)
         : kind(k), lexeme(std::move(lex)), pos(p) {}
 
-    // 调试用：类型转文字
     std::string kind_name() const {
         switch (kind) {
             case TokenKind::KW_INT:     return "KW_INT";
             case TokenKind::KW_RETURN:  return "KW_RETURN";
+            case TokenKind::KW_IF:      return "KW_IF";
+            case TokenKind::KW_ELSE:    return "KW_ELSE";
             case TokenKind::IDENT:      return "IDENT";
             case TokenKind::NUMBER:     return "NUMBER";
             case TokenKind::PLUS:       return "PLUS";
@@ -61,6 +70,12 @@ struct Token {
             case TokenKind::ASSIGN:     return "ASSIGN";
             case TokenKind::NOT:        return "NOT";
             case TokenKind::COMMA:      return "COMMA";
+            case TokenKind::LT:         return "LT";
+            case TokenKind::GT:         return "GT";
+            case TokenKind::LE:         return "LE";
+            case TokenKind::GE:         return "GE";
+            case TokenKind::EQ:         return "EQ";
+            case TokenKind::NE:         return "NE";
             case TokenKind::LPAREN:     return "LPAREN";
             case TokenKind::RPAREN:     return "RPAREN";
             case TokenKind::LBRACE:     return "LBRACE";
@@ -73,10 +88,11 @@ struct Token {
     }
 };
 
-// 关键字字典
 inline const std::unordered_map<std::string, TokenKind> keywords = {
     {"int",    TokenKind::KW_INT},
     {"return", TokenKind::KW_RETURN},
+    {"if",     TokenKind::KW_IF},
+    {"else",   TokenKind::KW_ELSE},
 };
 
 }  // namespace toyc

@@ -73,6 +73,17 @@ struct AssignStmt : ASTNode {
         : name(std::move(n)), expr(std::move(e)) {}
 };
 
+// if 语句：if (cond) then [else else_stmt]（v0.3）
+struct IfStmt : ASTNode {
+    std::unique_ptr<ASTNode> cond;
+    std::unique_ptr<ASTNode> then_stmt;
+    std::unique_ptr<ASTNode> else_stmt;  // 可为空
+    IfStmt(std::unique_ptr<ASTNode> c,
+           std::unique_ptr<ASTNode> t,
+           std::unique_ptr<ASTNode> e)
+        : cond(std::move(c)), then_stmt(std::move(t)), else_stmt(std::move(e)) {}
+};
+
 // ---- 顶层 ----
 
 // 函数定义

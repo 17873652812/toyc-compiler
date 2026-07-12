@@ -103,7 +103,7 @@ private:
         return block;
     }
 
-    // Stmt → VarDecl | AssignStmt | ReturnStmt
+    // Stmt → VarDecl | AssignStmt | ReturnStmt | IfStmt | Block
     std::unique_ptr<ASTNode> parse_stmt() {
         if (match(TokenKind::KW_INT)) {
             return parse_var_decl();
@@ -112,6 +112,12 @@ private:
             auto expr = parse_expr();
             expect(TokenKind::SEMICOLON, "expected ';'");
             return std::make_unique<ReturnStmt>(std::move(expr));
+        }
+        if (match(TokenKind::KW_IF)) {
+            return parse_if_stmt();
+        }
+        if (check(TokenKind::LBRACE)) {
+            return parse_block();  // 花括号块也是一种语句
         }
         if (check(TokenKind::IDENT)) {
             return parse_assign_stmt();
@@ -139,11 +145,40 @@ private:
         return std::make_unique<AssignStmt>(name_tok.lexeme, std::move(expr));
     }
 
+    // IfStmt → 'if' '(' Expr ')' Stmt ('else' Stmt)?
+    // （'if' 已在 parse_stmt 里 match 掉了）
+    std::unique_ptr<IfStmt> parse_if_stmt() {
+        expect(TokenKind::LPAREN, "expected '(' after 'if'");
+        auto cond = parse_expr();
+        expect(TokenKind::RPAREN, "expected ')'");
+        auto then_stmt = parse_stmt();
+        std::unique_ptr<ASTNode> else_stmt;
+        if (match(TokenKind::KW_ELSE)) {
+            else_stmt = parse_stmt();
+        }
+        return std::make_unique<IfStmt>(std::move(cond),
+            std::move(then_stmt), std::move(else_stmt));
+    }
+
     // ---- 表达式（按优先级分层） ----
 
-    // Expr → AddExpr
+    // Expr → RelExpr
     std::unique_ptr<ASTNode> parse_expr() {
-        return parse_add_expr();
+        return parse_rel_expr();
+    }
+
+    // RelExpr → AddExpr (('<'|'>'|'<='|'>='|'=='|'!=') AddExpr)*（v0.3）
+    std::unique_ptr<ASTNode> parse_rel_expr() {
+        auto left = parse_add_expr();
+        while (check(TokenKind::LT) || check(TokenKind::GT)
+               || check(TokenKind::LE) || check(TokenKind::GE)
+               || check(TokenKind::EQ) || check(TokenKind::NE)) {
+            std::string op = advance().lexeme;
+            auto right = parse_add_expr();
+            left = std::make_unique<BinaryExpr>(
+                std::move(left), op, std::move(right));
+        }
+        return left;
     }
 
     // AddExpr → MulExpr (('+'|'-') MulExpr)*
