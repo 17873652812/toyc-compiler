@@ -40,7 +40,9 @@
       "Bash(./build/compiler.exe)",
       "Bash(/c/Users/jiure/Desktop/toyc/build/compiler.exe /c/Users/jiure/Desktop/toyc/test/test0.tc)",
       "Bash(./compiler.exe ../test/test0.tc)",
-      "Bash(/c/Users/jiure/Desktop/toyc/compiler.exe)"
+      "Bash(/c/Users/jiure/Desktop/toyc/compiler.exe)",
+      "Bash(git add *)",
+      "Bash(git commit *)"
     ]
   }
 }
