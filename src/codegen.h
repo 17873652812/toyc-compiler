@@ -96,11 +96,26 @@ private:
         return "";  // 栈传参，不返回寄存器名
     }
 
+    // 递归统计所有变量（含嵌套 Block 内的）
     int count_vars(const Block* block) {
         int n = 0;
-        for (const auto& stmt : block->stmts)
+        for (const auto& stmt : block->stmts) {
             if (dynamic_cast<const VarDecl*>(stmt.get())) n++;
+            else if (auto* b = dynamic_cast<const Block*>(stmt.get()))
+                n += count_vars(b);
+            else if (auto* ifs = dynamic_cast<const IfStmt*>(stmt.get())) {
+                n += count_vars_in_stmt(ifs->then_stmt.get());
+                if (ifs->else_stmt) n += count_vars_in_stmt(ifs->else_stmt.get());
+            }
+            else if (auto* ws = dynamic_cast<const WhileStmt*>(stmt.get()))
+                n += count_vars_in_stmt(ws->body.get());
+        }
         return n;
+    }
+    int count_vars_in_stmt(const ASTNode* s) {
+        if (auto* b = dynamic_cast<const Block*>(s)) return count_vars(b);
+        if (auto* vd = dynamic_cast<const VarDecl*>(s)) return 1;
+        return 0;
     }
 
     // ---- 函数 ----
@@ -167,10 +182,21 @@ private:
         }
         if (auto* as = dynamic_cast<const AssignStmt*>(stmt)) {
             int* off = find_var(as->name);
-            if (!off) throw std::runtime_error("undefined: " + as->name);
-            gen_expr(as->expr.get());
-            out_ << "    sw t0, " << *off << "(sp)\n";
-            return;
+            if (off) {
+                gen_expr(as->expr.get());
+                out_ << "    sw t0, " << *off << "(sp)\n";
+                return;
+            }
+            // 全局变量赋值（v1.0）
+            auto gi = global_vars_.find(as->name);
+            if (gi != global_vars_.end()) {
+                gen_expr(as->expr.get());
+                out_ << "    la t1, " << as->name << "\n";
+                out_ << "    sw t0, 0(t1)\n";
+                global_vars_[as->name] = 0;  // 值不再可静态确定
+                return;
+            }
+            throw std::runtime_error("undefined: " + as->name);
         }
         if (auto* ret = dynamic_cast<const ReturnStmt*>(stmt)) {
             if (ret->expr) { gen_expr(ret->expr.get()); out_ << "    mv a0, t0\n"; }
@@ -242,7 +268,9 @@ private:
             if (off) { out_ << "    lw t0, " << *off << "(sp)\n"; return; }
             auto gi = global_vars_.find(id->name);
             if (gi != global_vars_.end()) {
-                out_ << "    li t0, " << gi->second << "\n";
+                // 从全局标签加载（支持运行时修改）
+                out_ << "    la t0, " << id->name << "\n";
+                out_ << "    lw t0, 0(t0)\n";
                 return;
             }
             throw std::runtime_error("undefined: " + id->name);
