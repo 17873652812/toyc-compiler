@@ -1,0 +1,9 @@
+int main() {
+    int a = 0;
+    int b = 5;
+    int r1 = 0;
+    int r2 = 0;
+    if ((b > 0) && (a == 0)) r1 = 1;
+    if ((a == 1) || (b > 0)) r2 = 1;
+    return r1 * 10 + r2;
+}

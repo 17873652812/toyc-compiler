@@ -1,0 +1,7 @@
+int add3(int a, int b, int c) { return a + b + c; }
+int sub(int a, int b) { return a - b; }
+int main() {
+    int r = add3(1, 2, 3);
+    int s = sub(10, 4);
+    return r * 100 + s;
+}

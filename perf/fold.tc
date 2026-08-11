@@ -1,0 +1,6 @@
+int main() {
+    int x = 1 + 2 * 3;
+    int y = x * 4;
+    if (1) return y + 5;
+    return 999;
+}
