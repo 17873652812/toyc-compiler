@@ -1,0 +1,11 @@
+int main() {
+    int a = 3;
+    int b = 7;
+    int c = 2;
+    int r = 0;
+    if (a < b && b > c) r = r + 1;
+    if (a > b || c < b) r = r + 2;
+    if (!(a == c)) r = r + 4;
+    if (a >= 3 && b <= 7 && c != 1) r = r + 8;
+    return r;
+}

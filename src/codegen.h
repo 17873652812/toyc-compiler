@@ -158,15 +158,15 @@ private:
         return false;
     }
 
-    // 表达式需要的同时内存临时槽数（右子树有调用时左值必须用内存）
+    // 表达式需要的同时内存临时槽数（保守：任意二元都算内存槽，含嵌套深度）
+    // 实际生成时寄存器临时值（t1-t5）能省掉部分内存，但按最坏情况预留保证不溢出
     int max_mem_temp_expr(const ASTNode* n) {
         if (auto* b = dynamic_cast<const BinaryExpr*>(n)) {
             if (b->op == "&&" || b->op == "||")
                 return std::max(max_mem_temp_expr(b->left.get()), max_mem_temp_expr(b->right.get()));
             int L = max_mem_temp_expr(b->left.get());
             int R = max_mem_temp_expr(b->right.get());
-            if (contains_call(b->right.get())) return std::max(L, 1 + R);
-            return std::max(L, R);  // 无调用 → 用寄存器临时值
+            return std::max(L, 1 + R);  // 左值占 1 槽 + 右子树深度
         }
         if (auto* u = dynamic_cast<const UnaryExpr*>(n)) return max_mem_temp_expr(u->expr.get());
         if (auto* c = dynamic_cast<const CallExpr*>(n)) {
@@ -634,19 +634,21 @@ private:
             if (opt_ && simplify_binary(bin)) return;
             // 普通二元运算
             gen_expr(bin->left.get());
-            if (opt_ && reg_temp_depth_ < 6 && !contains_call(bin->right.get())) {
-                // 左值存到 t1-t6（右子树无调用，安全）
+            // 左值暂存：深度<5 且右子树无调用时用寄存器 t1-t5；
+            // 否则用内存（弹回 t6，t6 专做临时，不参与寄存器临时值，绝不覆盖外层值）
+            if (opt_ && reg_temp_depth_ < 5 && !contains_call(bin->right.get())) {
                 reg_temp_depth_++;
                 out_ << "    mv t" << reg_temp_depth_ << ", t0\n";
                 gen_expr(bin->right.get());
                 gen_bin_op(bin->op, "t" + std::to_string(reg_temp_depth_));
                 reg_temp_depth_--;
             } else {
-                // 右子树有调用 → 用内存暂存（调用不会覆盖帧内临时区）
-                push_t0();
+                extra_stack_ += 4;
+                out_ << "    sw t0, " << (temp_base_ + extra_stack_) << "(sp)\n";
                 gen_expr(bin->right.get());
-                pop_to_t1();
-                gen_bin_op(bin->op, "t1");
+                out_ << "    lw t6, " << (temp_base_ + extra_stack_) << "(sp)\n";
+                extra_stack_ -= 4;
+                gen_bin_op(bin->op, "t6");
             }
             return;
         }
@@ -775,17 +777,6 @@ private:
             return v;
         }
         throw std::runtime_error("non-const expression in const init");
-    }
-
-    // ---- 临时栈（-opt 用帧底正偏移，函数调用不会覆盖） ----
-
-    void push_t0() {
-        extra_stack_ += 4;
-        out_ << "    sw t0, " << (temp_base_ + extra_stack_) << "(sp)\n";
-    }
-    void pop_to_t1() {
-        out_ << "    lw t1, " << (temp_base_ + extra_stack_) << "(sp)\n";
-        extra_stack_ -= 4;
     }
 
     // ---- 运算 ----
