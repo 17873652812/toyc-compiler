@@ -78,18 +78,42 @@ private:
     int var_base_ = 0;          // 溢出变量区基址
     int temp_limit_ = 256;      // 临时区大小（字节）
 
-    void enter_scope() { symtab_.push_back({}); consts_.push_back({}); }
-    void exit_scope() { symtab_.pop_back(); consts_.pop_back(); }
+    std::vector<int> scope_reg_base_;   // 每个作用域进入时的寄存器水位（-opt 回收用）
+    std::vector<int> scope_off_base_;   // 每个作用域进入时的栈偏移水位
+
+    void enter_scope() {
+        symtab_.push_back({}); consts_.push_back({});
+        if (opt_) {
+            scope_reg_base_.push_back(next_reg_);
+            scope_off_base_.push_back(next_offset_);
+        }
+    }
+    void exit_scope() {
+        // 回收该块分配的寄存器/栈槽（块退出后变量不可见，可复用）
+        // 仅 -opt 启用（非 -opt 用 count_vars 预分配帧，回收会破坏偏移）
+        if (opt_ && !scope_reg_base_.empty()) {
+            next_reg_ = scope_reg_base_.back();
+            next_offset_ = scope_off_base_.back();
+            scope_reg_base_.pop_back();
+            scope_off_base_.pop_back();
+        }
+        symtab_.pop_back(); consts_.pop_back();
+    }
 
     // 分配变量：-opt 优先用 s 寄存器，溢出到栈
+    int max_reg_used_ = 0;   // 函数实际用到的最大 s 寄存器数（回收后仍保存）
+    int max_offset_used_ = 0;  // 函数实际用到的最大栈偏移（回收后仍留空间）
+
     VarLoc alloc_var(const std::string& name) {
         VarLoc loc;
         if (opt_ && next_reg_ < 12) {
             loc.in_reg = true;
             loc.reg = next_reg_++;
+            if (next_reg_ > max_reg_used_) max_reg_used_ = next_reg_;
         } else {
             loc.off = var_base_ + next_offset_;
             next_offset_ += 4;
+            if (next_offset_ > max_offset_used_) max_offset_used_ = next_offset_;
         }
         symtab_.back()[name] = loc;
         return loc;
@@ -339,8 +363,12 @@ private:
         extra_stack_ = 0;
         next_offset_ = 0;
         next_reg_ = 0;
+        max_reg_used_ = 0;
+        max_offset_used_ = 0;
         var_base_ = 0;
         loops_.clear();
+        scope_reg_base_.clear();
+        scope_off_base_.clear();
 
         // 参数 slot
         for (auto& p : func->params) alloc_var(p);
@@ -396,8 +424,12 @@ private:
         extra_stack_ = 0;
         next_offset_ = 0;
         next_reg_ = 0;
+        max_reg_used_ = 0;
+        max_offset_used_ = 0;
         reg_temp_depth_ = 0;
         loops_.clear();
+        scope_reg_base_.clear();
+        scope_off_base_.clear();
 
         // 预分析：临时区大小
         int np = (int)func->params.size();
@@ -428,8 +460,8 @@ private:
         out_.swap(body_buf);
 
         // 计算帧大小
-        int n_spilled = next_offset_ / 4;
-        int n_saved = next_reg_;
+        int n_spilled = max_offset_used_ / 4;   // 用最大值，块回收后仍留足空间
+        int n_saved = max_reg_used_;   // 保存整个函数用到的所有 s 寄存器（含已回收块的）
         int frame = temp_limit_ + n_spilled * 4 + n_saved * 4 + 4;
         if (np > 8) frame = std::max(frame, (np - 7) * 4);  // 栈参数读取区
         if (frame < 16) frame = 16;

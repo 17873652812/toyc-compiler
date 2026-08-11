@@ -1,0 +1,7 @@
+int add2(int a, int b) { return a + b; }
+int f(int x, int y, int z) { return x + y + z; }
+int main_test() {
+    int r = f(add2(1,2), add2(3,4), add2(5,6));
+    return r;   // 3+7+11 = 21
+}
+int main() { return (unsigned char)main_test(); }

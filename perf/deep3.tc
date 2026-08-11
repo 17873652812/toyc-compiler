@@ -1,0 +1,5 @@
+int inc(int x) { return x + 1; }
+int main() {
+    int r = inc(inc(inc(inc(inc(inc(10))))));
+    return r;   // 16
+}

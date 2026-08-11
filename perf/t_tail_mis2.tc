@@ -1,0 +1,4 @@
+int calc(int n) { return n * 2; }
+int main() {
+    return calc(21);            // return 调用其他函数，不是尾递归
+}
