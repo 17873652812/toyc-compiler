@@ -192,6 +192,26 @@ private:
         if (auto* u = dynamic_cast<const UnaryExpr*>(e)) return max_call_chain_slots(u->expr.get());
         return 0;
     }
+    int max_call_chain_slots_stmt(const ASTNode* s) {
+        if (auto* b = dynamic_cast<const Block*>(s)) {
+            int m = 0;
+            for (auto& st : b->stmts) m = std::max(m, max_call_chain_slots_stmt(st.get()));
+            return m;
+        }
+        if (auto* vd = dynamic_cast<const VarDecl*>(s)) return max_call_chain_slots(vd->init.get());
+        if (auto* cd = dynamic_cast<const ConstDecl*>(s)) return max_call_chain_slots(cd->init.get());
+        if (auto* as = dynamic_cast<const AssignStmt*>(s)) return max_call_chain_slots(as->expr.get());
+        if (auto* ret = dynamic_cast<const ReturnStmt*>(s)) return ret->expr ? max_call_chain_slots(ret->expr.get()) : 0;
+        if (auto* ifs = dynamic_cast<const IfStmt*>(s)) {
+            int m = max_call_chain_slots(ifs->cond.get());
+            m = std::max(m, max_call_chain_slots_stmt(ifs->then_stmt.get()));
+            if (ifs->else_stmt) m = std::max(m, max_call_chain_slots_stmt(ifs->else_stmt.get()));
+            return m;
+        }
+        if (auto* ws = dynamic_cast<const WhileStmt*>(s))
+            return std::max(max_call_chain_slots(ws->cond.get()), max_call_chain_slots_stmt(ws->body.get()));
+        return 0;
+    }
     int max_mem_temp_stmt(const ASTNode* s) {
         if (auto* b = dynamic_cast<const Block*>(s)) {
             int m = 0;
@@ -326,7 +346,13 @@ private:
         for (auto& p : func->params) alloc_var(p);
         int nvars = count_vars(func->body.get());
         int total_vars = (int)func->params.size() + nvars;
-        int frame_size = total_vars * 4 + 4 + 256;  // +256 临时值缓冲区
+        // 临时值缓冲区：256 + 调用参数暂存预留（gen_call 会把参数暂存到临时区，
+        // 嵌套调用参数槽最多累计 max_call_chain_slots 个，需预留避免溢出）
+        int call_slots = 0;
+        for (auto& s : func->body->stmts)
+            call_slots = std::max(call_slots, max_call_chain_slots_stmt(s.get()));
+        int temp_buf = 256 + call_slots * 4;
+        int frame_size = total_vars * 4 + 4 + temp_buf;  // 变量区之后，ra之前
         if (frame_size < 16) frame_size = 16;
         frame_size = (frame_size + 15) & ~15;
         stack_size_ = frame_size;
