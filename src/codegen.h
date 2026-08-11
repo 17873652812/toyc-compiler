@@ -707,6 +707,31 @@ private:
             if (bin->op == "||") { gen_short_circuit_or(bin); return; }
             // 代数化简（-opt）
             if (opt_ && simplify_binary(bin)) return;
+
+            // 寄存器操作数优化（-opt）：左右操作数若是 s 寄存器变量，直接用作操作数，
+            // 省掉 mv 搬运。只在右子树无调用（t 寄存器安全）且非短路时用。
+            if (opt_ && !contains_call(bin->right.get())) {
+                std::string lr = simple_var_reg(bin->left.get());   // 左是变量→"sX"，否则空
+                std::string rr = simple_var_reg(bin->right.get());  // 右是变量→"sY"，否则空
+                if (!lr.empty() && !rr.empty()) {
+                    // 左右都是寄存器变量：add t0, sX, sY（一条指令）
+                    gen_bin_op2(bin->op, lr, rr);
+                    return;
+                }
+                if (!rr.empty()) {
+                    // 右是变量：先算左到 t0，再 op t0, t0, sY
+                    gen_expr(bin->left.get());
+                    gen_bin_op2(bin->op, "t0", rr);
+                    return;
+                }
+                if (!lr.empty()) {
+                    // 左是变量：先算右到 t0，再 op t0, sX, t0（比较需注意方向）
+                    gen_expr(bin->right.get());
+                    gen_bin_op2(bin->op, lr, "t0");
+                    return;
+                }
+            }
+
             // 普通二元运算
             gen_expr(bin->left.get());
             // 左值暂存：深度<5 且右子树无调用时用寄存器 t1-t5；
@@ -734,6 +759,18 @@ private:
             gen_call(call); return;
         }
         throw std::runtime_error("Codegen: unknown expression");
+    }
+
+    // 若表达式是 s 寄存器中的变量（非 const、非全局），返回其寄存器名；否则空串
+    std::string simple_var_reg(const ASTNode* e) {
+        if (auto* id = dynamic_cast<const IdExpr*>(e)) {
+            if (find_const(id->name)) return "";   // const 是立即数，不算
+            if (VarLoc* loc = find_var(id->name)) {
+                if (loc->in_reg) return "s" + std::to_string(loc->reg);
+            }
+            return "";
+        }
+        return "";
     }
 
     // 代数化简：x+0, x-0, x*1, x*0, x*2^k, x/1, x%1
@@ -866,19 +903,25 @@ private:
 
     // ---- 运算 ----
 
-    void gen_bin_op(const std::string& op, const std::string& l) {
-        if (op == "+") out_ << "    add t0, " << l << ", t0\n";
-        else if (op == "-") out_ << "    sub t0, " << l << ", t0\n";
-        else if (op == "*") out_ << "    mul t0, " << l << ", t0\n";
-        else if (op == "/") out_ << "    div t0, " << l << ", t0\n";
-        else if (op == "%") out_ << "    rem t0, " << l << ", t0\n";
-        else if (op == "<") out_ << "    slt t0, " << l << ", t0\n";
-        else if (op == ">") out_ << "    slt t0, t0, " << l << "\n";
-        else if (op == "<=") { out_ << "    slt t0, t0, " << l << "\n    xori t0, t0, 1\n"; }
-        else if (op == ">=") { out_ << "    slt t0, " << l << ", t0\n    xori t0, t0, 1\n"; }
-        else if (op == "==") { out_ << "    sub t0, " << l << ", t0\n    seqz t0, t0\n"; }
-        else if (op == "!=") { out_ << "    sub t0, " << l << ", t0\n    snez t0, t0\n"; }
+    // 双寄存器运算：t0 = l op r（l、r 是任意寄存器名）
+    void gen_bin_op2(const std::string& op, const std::string& l, const std::string& r) {
+        if (op == "+") out_ << "    add t0, " << l << ", " << r << "\n";
+        else if (op == "-") out_ << "    sub t0, " << l << ", " << r << "\n";
+        else if (op == "*") out_ << "    mul t0, " << l << ", " << r << "\n";
+        else if (op == "/") out_ << "    div t0, " << l << ", " << r << "\n";
+        else if (op == "%") out_ << "    rem t0, " << l << ", " << r << "\n";
+        else if (op == "<") out_ << "    slt t0, " << l << ", " << r << "\n";
+        else if (op == ">") out_ << "    slt t0, " << r << ", " << l << "\n";
+        else if (op == "<=") { out_ << "    slt t0, " << r << ", " << l << "\n    xori t0, t0, 1\n"; }
+        else if (op == ">=") { out_ << "    slt t0, " << l << ", " << r << "\n    xori t0, t0, 1\n"; }
+        else if (op == "==") { out_ << "    sub t0, " << l << ", " << r << "\n    seqz t0, t0\n"; }
+        else if (op == "!=") { out_ << "    sub t0, " << l << ", " << r << "\n    snez t0, t0\n"; }
         else throw std::runtime_error("unknown binop: " + op);
+    }
+
+    // 单寄存器运算（旧路径）：t0 = l op t0
+    void gen_bin_op(const std::string& op, const std::string& l) {
+        gen_bin_op2(op, l, "t0");
     }
 
     void gen_un_op(const std::string& op) {

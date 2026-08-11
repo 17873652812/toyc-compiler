@@ -47,8 +47,10 @@ int main(int argc, char** argv) {
     uint32_t pending_data = 0;                    // 当前 .word 应写入的地址
     char line[512];
     while (fgets(line, sizeof line, stdin)) {
-        // 去掉注释和空白
+        // 去掉注释、回车、空白
         char* c = strchr(line, '#'); if (c) *c = 0;
+        size_t ll = strlen(line);
+        while (ll && (line[ll-1]=='\n' || line[ll-1]=='\r')) line[--ll] = 0;
         // 指令
         char op[64] = {0};
         if (sscanf(line, " %63s", op) != 1) continue;
