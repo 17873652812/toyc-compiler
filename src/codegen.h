@@ -364,6 +364,7 @@ private:
     void gen_func_opt(const FuncDef* func) {
         current_func_ = func->name;
         current_params_ = func->params;
+        current_param_vars_.clear();   // 关键：清空上一个函数的参数位置
         symtab_.clear(); symtab_.push_back({});
         consts_.clear(); consts_.push_back({});
         extra_stack_ = 0;
