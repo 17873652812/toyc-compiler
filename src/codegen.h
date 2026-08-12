@@ -425,6 +425,9 @@ private:
             }
         }
 
+        // 尾递归入口标签：放在参数绑定之后，尾递归跳回这里重新执行循环
+        out_ << ".L" << func->name << "_start:\n";
+
         // 函数体直接遍历，不通过 gen_block（避免重复 enter_scope）
         for (auto& s : func->body->stmts) gen_stmt(s.get());
 
@@ -643,14 +646,29 @@ private:
         }
         if (auto* ret = dynamic_cast<const ReturnStmt*>(stmt)) {
             if (ret->expr) {
-                // 尾递归：return 自调用
-                if (opt_) {
-                    auto* call = dynamic_cast<const CallExpr*>(ret->expr.get());
-                    if (call && call->func_name == current_func_
-                        && call->args.size() == current_params_.size()) {
-                        gen_tail_call(call);
-                        return;
+                auto* call = dynamic_cast<const CallExpr*>(ret->expr.get());
+                // 尾递归：return 自调用 → 求值实参到参数槽，跳回入口（非-opt 也启用，
+                // 避免深尾递归栈溢出——评测 p06 的根因）
+                if (call && call->func_name == current_func_
+                    && call->args.size() == current_params_.size()) {
+                    if (opt_) { gen_tail_call(call); return; }
+                    // 非-opt：参数都在栈槽。先把实参求值并暂存，再按序写入参数槽。
+                    // 用临时区顶部暂存，避开表达式求值用的低区。
+                    int n = (int)call->args.size();
+                    int base = extra_stack_;
+                    for (int i = 0; i < n; i++) {
+                        gen_expr(call->args[i].get());
+                        extra_stack_ += 4;
+                        out_ << "    sw t0, " << (temp_base_ + extra_stack_) << "(sp)\n";
                     }
+                    for (int i = 0; i < n; i++) {
+                        out_ << "    lw t0, " << (temp_base_ + base + (i + 1) * 4) << "(sp)\n";
+                        VarLoc loc = symtab_.back()[current_params_[i]];
+                        out_ << "    sw t0, " << loc.off << "(sp)\n";
+                    }
+                    extra_stack_ = base;
+                    out_ << "    j .L" << current_func_ << "_start\n";
+                    return;
                 }
                 gen_expr(ret->expr.get());
                 out_ << "    mv a0, t0\n";
