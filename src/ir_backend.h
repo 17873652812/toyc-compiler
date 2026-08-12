@@ -774,112 +774,6 @@ static void fuse_cmp_branch(IrFunc& f) {
     }
 }
 
-// 跨块 CSE（全局值编号 + 支配检查）：
-// 对操作数都是"单赋值 vreg 或常量"的纯计算表达式做全局值编号，
-// 复用安全条件：表达式计算所在基本块必须支配当前使用块
-//（支配保证表达式在当前路径上一定执行过，值已计算）。
-// 涉及可变槽变量的表达式仍只在块内 CSE（cse_bb 负责）。
-static bool cse_global(IrFunc& f) {
-    auto ranges = bb_ranges(f);
-    int nb = (int)ranges.size();
-    if (nb < 2) return false;
-    std::vector<int> blk_of(f.insns.size());
-    for (int bi = 0; bi < nb; bi++)
-        for (int i = ranges[bi].first; i < ranges[bi].second; i++)
-            blk_of[i] = bi;
-    // CFG + 支配者
-    std::unordered_map<int, int> lbl2blk;
-    for (int bi = 0; bi < nb; bi++)
-        for (int i = ranges[bi].first; i < ranges[bi].second; i++)
-            if (f.insns[i].op == IROp::LABEL) lbl2blk[f.insns[i].label] = bi;
-    std::vector<std::vector<int>> pred(nb), succ(nb);
-    for (int bi = 0; bi < nb; bi++) {
-        int last = ranges[bi].second - 1;
-        IROp op = f.insns[last].op;
-        auto link = [&](int a, int b) { succ[a].push_back(b); pred[b].push_back(a); };
-        if (op == IROp::BZ || op == IROp::BNZ || op == IROp::BLT || op == IROp::BGE) {
-            auto it = lbl2blk.find(f.insns[last].label);
-            if (it != lbl2blk.end()) link(bi, it->second);
-            if (bi + 1 < nb) link(bi, bi + 1);
-        } else if (op == IROp::BR) {
-            auto it = lbl2blk.find(f.insns[last].label);
-            if (it != lbl2blk.end()) link(bi, it->second);
-        } else if (op != IROp::RET && bi + 1 < nb) {
-            link(bi, bi + 1);
-        }
-    }
-    std::vector<std::unordered_set<int>> dom(nb);
-    dom[0].insert(0);
-    for (int bi = 1; bi < nb; bi++) for (int i = 0; i < nb; i++) dom[bi].insert(i);
-    bool ch = true;
-    while (ch) {
-        ch = false;
-        for (int bi = 1; bi < nb; bi++) {
-            std::unordered_set<int> nd;
-            if (pred[bi].empty()) nd.insert(bi);
-            else {
-                nd = dom[pred[bi][0]];
-                for (size_t pi = 1; pi < pred[bi].size(); pi++) {
-                    std::unordered_set<int> inter;
-                    for (int v : nd) if (dom[pred[bi][pi]].count(v)) inter.insert(v);
-                    nd = std::move(inter);
-                }
-                nd.insert(bi);
-            }
-            if (nd != dom[bi]) { dom[bi] = std::move(nd); ch = true; }
-        }
-    }
-    // 单赋值：临时 vreg 定义 ≤1 次 → 值固定；参数必须从未被赋值（def_count==0）
-    std::unordered_set<int> params(f.params.begin(), f.params.end());
-    std::unordered_map<int, int> def_count;
-    for (const Insn& in : f.insns) if (in.d >= 0) def_count[in.d]++;
-    auto single = [&](int v) {
-        if (v < 0) return true;
-        if (params.count(v)) return def_count.count(v) && def_count[v] == 0;
-        return def_count.count(v) && def_count[v] <= 1;
-    };
-    // 全局值编号：key → (结果 vreg, 计算所在块)
-    std::unordered_map<std::string, std::pair<int, int>> tab;
-    bool changed = false;
-    for (size_t i = 0; i < f.insns.size(); i++) {
-        Insn& in = f.insns[i];
-        std::string key;
-        bool pure = true;
-        auto ok2 = [&](int a, int b) { return single(a) && single(b); };
-        switch (in.op) {
-        case IROp::CONST: key = "C," + std::to_string(in.imm); break;
-        case IROp::ADD: if (!ok2(in.a, in.b)) pure = false; else key = "A," + std::to_string(in.a) + "," + std::to_string(in.b); break;
-        case IROp::SUB: if (!ok2(in.a, in.b)) pure = false; else key = "S," + std::to_string(in.a) + "," + std::to_string(in.b); break;
-        case IROp::MUL: if (!ok2(in.a, in.b)) pure = false; else key = "M," + std::to_string(in.a) + "," + std::to_string(in.b); break;
-        case IROp::DIV: if (!ok2(in.a, in.b)) pure = false; else key = "D," + std::to_string(in.a) + "," + std::to_string(in.b); break;
-        case IROp::REM: if (!ok2(in.a, in.b)) pure = false; else key = "R," + std::to_string(in.a) + "," + std::to_string(in.b); break;
-        case IROp::SLT: if (!ok2(in.a, in.b)) pure = false; else key = "L," + std::to_string(in.a) + "," + std::to_string(in.b); break;
-        case IROp::ADDI: if (!single(in.a)) pure = false; else key = "I," + std::to_string(in.a) + "," + std::to_string(in.imm); break;
-        case IROp::SLTI: if (!single(in.a)) pure = false; else key = "i," + std::to_string(in.a) + "," + std::to_string(in.imm); break;
-        case IROp::SLLI: if (!single(in.a)) pure = false; else key = "l," + std::to_string(in.a) + "," + std::to_string(in.imm); break;
-        case IROp::NEG: if (!single(in.a)) pure = false; else key = "N," + std::to_string(in.a); break;
-        case IROp::SEQZ: if (!single(in.a)) pure = false; else key = "Z," + std::to_string(in.a); break;
-        case IROp::SNEZ: if (!single(in.a)) pure = false; else key = "z," + std::to_string(in.a); break;
-        case IROp::LA: key = "G," + in.name; break;
-        default: pure = false;
-        }
-        if (pure && in.d >= 0) {
-            auto it = tab.find(key);
-            if (it != tab.end() && it->second.first != in.d &&
-                dom[blk_of[i]].count(it->second.second)) {
-                // 计算块支配当前块 → 一定执行过 → 安全复用
-                in.op = IROp::MOV;
-                in.a = it->second.first;
-                in.b = -1;
-                changed = true;
-            } else {
-                tab[key] = {in.d, blk_of[i]};
-            }
-        }
-    }
-    return changed;
-}
-
 // LICM-常量外提：把循环内不变的 CONST/LA 指令移到函数入口。
 // CONST/LA 无副作用，提前/无条件执行语义不变；省掉循环每次迭代的 li/la。
 static void licm_const(IrFunc& f) {
@@ -1046,158 +940,6 @@ static void dce(IrFunc& f) {
     }
 }
 
-// ---------- 归纳变量强度削减 ----------
-
-static int max_vreg(const IrFunc& f) {
-    int m = -1;
-    auto upd = [&](int v) { if (v > m) m = v; };
-    for (const Insn& in : f.insns) { upd(in.d); upd(in.a); upd(in.b); for (int v : in.args) upd(v); }
-    for (int p : f.params) upd(p);
-    return m;
-}
-
-// 强度削减：识别循环 `MUL tmp, i, c`（c>0常量）且 i 是 +k 归纳变量，
-// 循环条件是 `i < N`。引入 t = c*i 归纳变量：
-//   - 循环前 li t,0；li tN, c*N
-//   - 循环里 MUL 换成读 t，条件换成 BGE t, tN，删除 ADDI i
-// 循环体从 (bge/mul/add/addi/j) 5 条 → (bge/add/addi/j) 4 条，且 mul 消失。
-// 只处理最干净的单块循环模式，否则跳过。
-static void strength_reduce(IrFunc& f) {
-    std::unordered_map<int, int> constval;
-    for (const Insn& in : f.insns)
-        if (in.op == IROp::CONST) constval[in.d] = in.imm;
-    auto ranges = bb_ranges(f);
-    std::unordered_map<int, int> lbl2blk;
-    for (size_t bi = 0; bi < ranges.size(); bi++)
-        for (int i = ranges[bi].first; i < ranges[bi].second; i++)
-            if (f.insns[i].op == IROp::LABEL) lbl2blk[f.insns[i].label] = (int)bi;
-    int next_vreg = max_vreg(f) + 1;
-
-    for (size_t bi = 0; bi < ranges.size(); bi++) {
-        int last = ranges[bi].second - 1;
-        if (last < 0 || f.insns[last].op != IROp::BR) continue;
-        auto it = lbl2blk.find(f.insns[last].label);
-        if (it == lbl2blk.end()) continue;
-        int lb = it->second;
-        if (lb > (int)bi) continue;
-        if (bi != lb && bi != lb + 1) continue;   // 单块或两块循环（条件块 + 体块）
-        int s = ranges[lb].first, e = ranges[bi].second;
-        // 寄存器压力估算：循环内引用的不同 vreg 数（含外部 live-in）。
-        // 归纳变量 t/tN 需 +2 个长存活寄存器，若已接近 17 上限则跳过
-        // （否则循环溢出 lw/sw 得不偿失，p08 的 17 变量循环即此情况）。
-        {
-            std::unordered_set<int> lv;
-            for (int i = s; i < e; i++) {
-                const Insn& in = f.insns[i];
-                if (in.d >= 0) lv.insert(in.d);
-                if (in.a >= 0) lv.insert(in.a);
-                if (in.b >= 0) lv.insert(in.b);
-                for (int v : in.args) lv.insert(v);
-            }
-            if ((int)lv.size() + 2 > 16) continue;
-        }
-        // 简单检查：无调用/内存/RET/嵌套条件分支。循环条件的 BGE/BLT 允许（最多 1 个）。
-        bool simple = true;
-        int cond_cnt = 0;
-        for (int i = s; i < e; i++) {
-            IROp op = f.insns[i].op;
-            if (op == IROp::CALL || op == IROp::STORE || op == IROp::BZ ||
-                op == IROp::BNZ || op == IROp::RET) { simple = false; break; }
-            if (op == IROp::BGE || op == IROp::BLT) cond_cnt++;
-        }
-        if (!simple || cond_cnt != 1) continue;
-        // 归纳变量：ADDI i, i, k（k>0）
-        int ind = -1, inc = 0;
-        for (int i = s; i < e; i++) {
-            const Insn& in = f.insns[i];
-            if (in.op == IROp::ADDI && in.a == in.d && in.a >= 0 && in.imm > 0) { ind = in.d; inc = in.imm; }
-        }
-        if (ind < 0) continue;
-        // MUL tmp, ind, c（c CONST>0）
-        int mul_idx = -1, mul_tmp = -1, mul_c = 0;
-        for (int i = s; i < e; i++) {
-            const Insn& in = f.insns[i];
-            if (in.op == IROp::MUL && in.a == ind && in.b >= 0 &&
-                constval.count(in.b) && constval[in.b] > 0) {
-                mul_idx = i; mul_tmp = in.d; mul_c = constval[in.b];
-            }
-        }
-        if (mul_idx < 0) continue;
-        // 循环条件：BGE ind, N（N CONST>0），在循环体开头
-        int cond_idx = -1, cond_N = 0;
-        for (int i = s; i < e; i++) {
-            const Insn& in = f.insns[i];
-            if ((in.op == IROp::BGE || in.op == IROp::BLT) && in.a == ind &&
-                in.b >= 0 && constval.count(in.b)) {
-                // BLT i, N = i < N 跳转（进循环）；BGE i, N = i>=N 跳转（退出）
-                cond_idx = i; cond_N = constval[in.b];
-            }
-        }
-        if (cond_idx < 0) continue;
-        // 确认 i 初值 = 0
-        bool i0_zero = false;
-        for (int i = s - 1; i >= 0; i--) {
-            const Insn& in = f.insns[i];
-            if (in.op == IROp::MOV && in.d == ind) {
-                i0_zero = (constval.count(in.a) && constval[in.a] == 0);
-                break;
-            }
-        }
-        if (!i0_zero) continue;
-        // 检查 mul_tmp 是否只在循环体内被使用（替换成读 t 安全）
-        // （宽松：只要循环体内用到即可，regalloc 处理）
-        int t = next_vreg++, tN = next_vreg++;
-        // 循环头前插 li t,0; li tN, c*N
-        Insn c0(IROp::CONST, t, -1, -1, 0);
-        Insn cn(IROp::CONST, tN, -1, -1, mul_c * cond_N);
-        f.insns.insert(f.insns.begin() + s, c0);
-        f.insns.insert(f.insns.begin() + s + 1, cn);
-        // 循环体改写（位置偏移：s 后 +2）
-        for (int i = s + 2; i < (int)f.insns.size(); i++) {
-            Insn& in = f.insns[i];
-            if (in.op == IROp::MUL && in.a == ind && in.b >= 0 && constval.count(in.b)) {
-                in.op = IROp::MOV; in.a = t; in.b = -1;
-            } else if (in.op == IROp::BGE && in.a == ind) {
-                in.a = t; in.b = tN;
-            } else if (in.op == IROp::BLT && in.a == ind) {
-                in.a = t; in.b = tN;
-            } else if (in.op == IROp::ADDI && in.d == ind && in.a == ind) {
-                in.op = IROp::NOP;   // 删除 i += k
-                // 在 NOP 位置后补 t += c*k
-                Insn add_t(IROp::ADDI, t, t, -1, mul_c * inc);
-                f.insns.insert(f.insns.begin() + i + 1, add_t);
-                break;
-            }
-        }
-    }
-}
-
-// 跳转合并（控制流清理）：`BR L1` 且 L1 是空块（LABEL + BR L2）→ 直接 BR L2。
-// 配合 DCE 的不可达块删除，清除中间空跳转。
-static void jump_threading(IrFunc& f) {
-    std::unordered_map<int, int> lbl_pos;
-    for (int i = 0; i < (int)f.insns.size(); i++)
-        if (f.insns[i].op == IROp::LABEL) lbl_pos[f.insns[i].label] = i;
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        for (int i = 0; i < (int)f.insns.size(); i++) {
-            Insn& in = f.insns[i];
-            if (in.op != IROp::BR) continue;
-            auto it = lbl_pos.find(in.label);
-            if (it == lbl_pos.end()) continue;
-            int t = it->second + 1;
-            while (t < (int)f.insns.size() &&
-                   (f.insns[t].op == IROp::LABEL || f.insns[t].op == IROp::NOP)) t++;
-            if (t < (int)f.insns.size() && f.insns[t].op == IROp::BR &&
-                f.insns[t].label != in.label) {
-                in.label = f.insns[t].label;
-                changed = true;
-            }
-        }
-    }
-}
-
 // 主优化入口：多轮迭代到稳定
 static void optimize_ir(IrFunc& f) {
     for (int round = 0; round < 4; round++) {
@@ -1207,13 +949,10 @@ static void optimize_ir(IrFunc& f) {
             changed |= const_fold_bb(f, pr.first, pr.second);
             changed |= copy_prop_bb(f, pr.first, pr.second);
             changed |= cse_bb(f, pr.first, pr.second);
-            changed |= cse_global(f);   // 跨块 CSE（全局值编号+支配）
         }
         changed |= merge_mov_into_op(f);   // 消除赋值后的 mv
         fuse_cmp_branch(f);                // SLT+BZ/BNZ → BLT/BGE（省 1 条/循环迭代）
         licm_const(f);                     // 循环内常量外提
-        dce(f);
-        jump_threading(f);                 // 跳转合并（DCE 强化）
         dce(f);
         if (!changed) break;
     }
@@ -1311,8 +1050,7 @@ struct RegAlloc {
     std::unordered_set<int> spilled;      // 溢出的虚拟寄存器
     std::unordered_map<int, int> slot;    // 溢出 → 栈偏移
     int frame = 0;        // 帧大小（字节）
-    int n_saved = 0;      // 需保存的 s 寄存器个数
-    std::vector<int> s_saved;   // 实际用到的 s 寄存器索引（稀疏，避免保存没用的）
+    int n_saved = 0;      // 需保存的 s 寄存器个数（s0..sK）
     int spill_bytes = 0;
 
     void run(const IrFunc& f) {
@@ -1320,7 +1058,6 @@ struct RegAlloc {
         static const std::vector<int> T = {6, 7, 28, 29, 30};                              // t1-t5
         static std::vector<int> ST;   // T 优先，然后 S
         if (ST.empty()) { for (int p : T) ST.push_back(p); for (int p : S) ST.push_back(p); }
-        int cap_all = 17;
 
         Liveness L = compute_liveness(f);
         int n = (int)f.insns.size();
@@ -1371,7 +1108,7 @@ struct RegAlloc {
         select_spill(cvregs, 12);
         std::vector<int> allv;
         for (auto& kv : first_pt) allv.push_back(kv.first);
-        select_spill(allv, cap_all);
+        select_spill(allv, 17);
 
         // 分配：跨调用 → S；非跨调用 → T 然后 S。一个 vreg 整个函数一个物理寄存器。
         // 关键：两个池共用同一个 owner 数组——否则第二个池会抢第一个池已占的寄存器
@@ -1409,13 +1146,12 @@ struct RegAlloc {
         spilled = spill;
         spill_bytes = sp;
 
-        // 保存实际用到的 s 寄存器（稀疏，只保存用到的，省 prologue/epilogue）
-        s_saved.clear();
+        // 保存的 s 寄存器个数（s0..sK）
+        int maxs = -1;
         for (auto& kv : phys)
             for (int j = 0; j < 12; j++)
-                if (kv.second == S[j]) s_saved.push_back(j);
-        std::sort(s_saved.begin(), s_saved.end());
-        n_saved = (int)s_saved.size();
+                if (kv.second == S[j] && j > maxs) maxs = j;
+        n_saved = maxs + 1;
 
         // 帧 = 溢出 + 保存的 s + ra + 栈参数区
         int nstack = std::max(0, f.param_count - 8);
@@ -1565,9 +1301,9 @@ static std::string emit_function(const IrFunc& f, const RegAlloc& ra) {
     out << ".globl " << f.name << "\n" << f.name << ":\n";
     out << "    addi sp, sp, -" << frame << "\n";
     out << "    sw ra, " << (frame - 4) << "(sp)\n";
-    // 保存用到的 s 寄存器（稀疏：只保存实际用到的）
-    for (int k = 0; k < ra.n_saved; k++)
-        out << "    sw s" << ra.s_saved[k] << ", " << (save_base + k * 4) << "(sp)\n";
+    // 保存用到的 s 寄存器
+    for (int j = 0; j < ra.n_saved; j++)
+        out << "    sw s" << j << ", " << (save_base + j * 4) << "(sp)\n";
     // 绑定形参 a0-a7
     for (int i = 0; i < f.param_count && i < 8; i++) {
         int p = f.params[i];
@@ -1585,8 +1321,8 @@ static std::string emit_function(const IrFunc& f, const RegAlloc& ra) {
     for (const Insn& in : f.insns) emit_insn(out, f, ra, in);
     // epilogue
     out << ".L" << f.name << "_exit:\n";
-    for (int k = ra.n_saved - 1; k >= 0; k--)
-        out << "    lw s" << ra.s_saved[k] << ", " << (save_base + k * 4) << "(sp)\n";
+    for (int j = ra.n_saved - 1; j >= 0; j--)
+        out << "    lw s" << j << ", " << (save_base + j * 4) << "(sp)\n";
     out << "    lw ra, " << (frame - 4) << "(sp)\n";
     out << "    addi sp, sp, " << frame << "\n";
     out << "    ret\n\n";
