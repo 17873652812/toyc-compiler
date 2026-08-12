@@ -42,6 +42,8 @@ enum class IROp {
     CALL,    // d = f(args...); d=-1 = void
     BZ,      // if (a == 0) goto label
     BNZ,     // if (a != 0) goto label
+    BLT,     // if (a < b) goto label（比较+分支融合）
+    BGE,     // if (a >= b) goto label（比较+分支融合）
     BR,      // goto label
     RET,     // return a (a=-1 = void)
     LABEL,   // 标签
@@ -441,7 +443,8 @@ static std::vector<std::pair<int, int>> bb_ranges(const IrFunc& f) {
     int start = 0;
     for (int i = 0; i < (int)v.size(); i++) {
         bool term = v[i].op == IROp::BR || v[i].op == IROp::BZ ||
-                    v[i].op == IROp::BNZ || v[i].op == IROp::RET;
+                    v[i].op == IROp::BNZ || v[i].op == IROp::BLT ||
+                    v[i].op == IROp::BGE || v[i].op == IROp::RET;
         bool next_label = (i + 1 < (int)v.size()) && v[i + 1].op == IROp::LABEL;
         if (term || next_label) {
             out.push_back({start, i + 1});
@@ -533,12 +536,15 @@ static bool const_fold_bb(IrFunc& f, int s, int e) {
                 else if (ka && fits(av)) { in.op = IROp::ADDI; in.a = in.b; in.b = -1; in.imm = av; done = true; }
             } else if (op == IROp::SUB) {
                 if (kb && bv == 0) { in.op = IROp::MOV; in.b = -1; done = true; }
+                else if (ka && av == 0) { in.op = IROp::NEG; in.a = in.b; in.b = -1; done = true; }   // 0-x → neg
                 else if (kb && fits(-(long long)bv)) { in.op = IROp::ADDI; in.b = -1; in.imm = -bv; done = true; }
             } else if (op == IROp::MUL) {
                 if (kb && bv == 1) { in.op = IROp::MOV; in.b = -1; done = true; }
                 else if (ka && av == 1) { in.op = IROp::MOV; in.a = in.b; in.b = -1; done = true; }
                 else if (kb && bv == 0) { in.op = IROp::CONST; in.a = in.b = -1; in.imm = 0; done = true; }
                 else if (ka && av == 0) { in.op = IROp::CONST; in.a = in.b = -1; in.imm = 0; done = true; }
+                else if (kb && bv == -1) { in.op = IROp::NEG; in.b = -1; done = true; }   // x * -1 → neg
+                else if (ka && av == -1) { in.op = IROp::NEG; in.a = in.b; in.b = -1; done = true; }   // -1 * x → neg
                 else if (kb && pow2k(bv, rv)) { in.op = IROp::SLLI; in.b = -1; in.imm = rv; done = true; }
                 else if (ka && pow2k(av, rv)) { in.op = IROp::SLLI; in.a = in.b; in.b = -1; in.imm = rv; done = true; }
             } else if (op == IROp::DIV) {
@@ -742,6 +748,30 @@ static bool merge_mov_into_op(IrFunc& f) {
     return changed;
 }
 
+// 比较+分支融合：`SLT d, X, Y` 后紧跟 `BZ/BNZ d, L` 且 d 仅此一处使用
+// → 合成单条 `BGE/BLT X, Y, L`（RISC-V 比较跳转），省掉 slt + beqz 两条。
+static void fuse_cmp_branch(IrFunc& f) {
+    std::unordered_map<int, int> uses;
+    for (const Insn& in : f.insns) {
+        if (in.a >= 0) uses[in.a]++;
+        if (in.b >= 0) uses[in.b]++;
+        for (int v : in.args) uses[v]++;
+    }
+    for (size_t i = 1; i < f.insns.size(); i++) {
+        Insn& br = f.insns[i];
+        if (br.op != IROp::BZ && br.op != IROp::BNZ) continue;
+        if (br.a < 0) continue;
+        Insn& sl = f.insns[i - 1];
+        if (sl.op != IROp::SLT) continue;
+        if (sl.d != br.a || uses[sl.d] != 1) continue;   // d 只被这个分支使用
+        // SLT d,X,Y; BZ d,L → BGE X,Y,L；BNZ → BLT X,Y,L
+        br.op = (br.op == IROp::BNZ) ? IROp::BLT : IROp::BGE;
+        br.a = sl.a;
+        br.b = sl.b;
+        sl.op = IROp::NOP;
+    }
+}
+
 // LICM-常量外提：把循环内不变的 CONST/LA 指令移到函数入口。
 // CONST/LA 无副作用，提前/无条件执行语义不变；省掉循环每次迭代的 li/la。
 static void licm_const(IrFunc& f) {
@@ -757,7 +787,7 @@ static void licm_const(IrFunc& f) {
         int last = ranges[bi].second - 1;
         IROp op = f.insns[last].op;
         auto link = [&](int a, int b) { succ[a].push_back(b); pred[b].push_back(a); };
-        if (op == IROp::BZ || op == IROp::BNZ) {
+        if (op == IROp::BZ || op == IROp::BNZ || op == IROp::BLT || op == IROp::BGE) {
             auto it = lbl2blk.find(f.insns[last].label);
             if (it != lbl2blk.end()) link(bi, it->second);
             if (bi + 1 < nb) link(bi, bi + 1);
@@ -847,7 +877,7 @@ static void dce(IrFunc& f) {
     for (int bi = 0; bi < nb; bi++) {
         int last = ranges[bi].second - 1;
         IROp op = f.insns[last].op;
-        if (op == IROp::BZ || op == IROp::BNZ) {
+        if (op == IROp::BZ || op == IROp::BNZ || op == IROp::BLT || op == IROp::BGE) {
             auto it = lbl2blk.find(f.insns[last].label);
             if (it != lbl2blk.end()) succ[bi].push_back(it->second);
             if (bi + 1 < nb) succ[bi].push_back(bi + 1);
@@ -883,7 +913,8 @@ static void dce(IrFunc& f) {
     auto is_removable = [](const Insn& in) {
         switch (in.op) {
         case IROp::CALL: case IROp::STORE: case IROp::BZ: case IROp::BNZ:
-        case IROp::BR: case IROp::RET: case IROp::LABEL:
+        case IROp::BLT: case IROp::BGE: case IROp::BR: case IROp::RET:
+        case IROp::LABEL:
             return false;
         default: return true;
         }
@@ -918,6 +949,7 @@ static void optimize_ir(IrFunc& f) {
             changed |= cse_bb(f, pr.first, pr.second);
         }
         changed |= merge_mov_into_op(f);   // 消除赋值后的 mv
+        fuse_cmp_branch(f);                // SLT+BZ/BNZ → BLT/BGE（省 1 条/循环迭代）
         licm_const(f);                     // 循环内常量外提
         dce(f);
         if (!changed) break;
@@ -946,7 +978,7 @@ static Liveness compute_liveness(const IrFunc& f) {
     for (int bi = 0; bi < nb; bi++) {
         int last = ranges[bi].second - 1;
         IROp op = f.insns[last].op;
-        if (op == IROp::BZ || op == IROp::BNZ) {
+        if (op == IROp::BZ || op == IROp::BNZ || op == IROp::BLT || op == IROp::BGE) {
             auto it = lbl2blk.find(f.insns[last].label);
             if (it != lbl2blk.end()) succ[bi].push_back(it->second);
             if (bi + 1 < nb) succ[bi].push_back(bi + 1);
@@ -1155,6 +1187,13 @@ static void emit_insn(std::ostringstream& out, const IrFunc& f, const RegAlloc& 
     case IROp::BZ: case IROp::BNZ: {
         std::string v = resolve_op(out, ra, in.a, "t0");
         out << "    " << (in.op == IROp::BZ ? "beqz" : "bnez") << " " << v
+            << ", .L" << f.name << "_" << in.label << "\n";
+        break;
+    }
+    case IROp::BLT: case IROp::BGE: {
+        std::string a = resolve_op(out, ra, in.a, "t0");
+        std::string b = resolve_op(out, ra, in.b, "t6");
+        out << "    " << (in.op == IROp::BLT ? "blt" : "bge") << " " << a << ", " << b
             << ", .L" << f.name << "_" << in.label << "\n";
         break;
     }

@@ -163,6 +163,12 @@ int main(int argc, char** argv) {
             int t = (i.op=="bnez") ? (r(regno(i.a))!=0) : (r(regno(i.a))!=r(regno(i.b)));
             if (t) { pc = findlbl(i.b); continue; }
         }
+        else if (i.op == "blt") {
+            if (r(regno(i.a)) < r(regno(i.b))) { pc = findlbl(i.c); continue; }
+        }
+        else if (i.op == "bge") {
+            if (r(regno(i.a)) >= r(regno(i.b))) { pc = findlbl(i.c); continue; }
+        }
         else if (i.op == "j") { pc = findlbl(i.a); continue; }
         else if (i.op == "jal") { R[regno(i.b)] = pc + 1; pc = findlbl(i.a); continue; }
         else if (i.op == "call") { R[1] = pc + 1; pc = findlbl(i.a); continue; }
