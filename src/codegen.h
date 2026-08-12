@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ast.h"
+#include "ir_backend.h"
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -39,8 +40,21 @@ public:
 
         out_ << ".text\n";
         // 不定义 _start —— 评测系统的 C 运行时会提供 _start 并调用 main
-        for (const auto& func : unit_.funcs)
-            gen_func(func.get());
+        if (opt_) {
+            // -opt：走 IR 后端（降级 → 优化 → 寄存器分配 → 发射）
+            IrBuilder builder(unit_);
+            for (const auto& func : unit_.funcs) {
+                IrFunc ir = builder.lower(func.get());
+                optimize_ir(ir);
+                RegAlloc ra;
+                ra.run(ir);
+                out_ << emit_function(ir, ra);
+            }
+        } else {
+            // 非 -opt：保留原实现（功能测试依赖，零风险）
+            for (const auto& func : unit_.funcs)
+                gen_func(func.get());
+        }
         return out_.str();
     }
 
