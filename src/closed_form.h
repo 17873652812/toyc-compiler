@@ -70,6 +70,11 @@ static bool closed_form_loops(IrFunc& f) {
         // 反转布局里，分支目标块若只是空标签块，其实际代码在下一个非空块——体块就在其后
         if (inverted && tgtblk < hb + 1) continue;
 
+        // 关键安全检查：循环必须是从 header 到 body 的"相邻单块"结构。
+        // 正常布局：body 就是紧邻 header 的那一块（bodyblk == hb+1）。
+        // 反转布局：bodyblk == hb+2（中间 hb+1 是出口代码块）。
+        // 若 bodyblk 是别的块（嵌套循环/条件把循环体拆成多块）→ 不闭合。
+        if (bodyblk != hb + 1 && bodyblk != hb + 2) continue;
         int bs = ranges[bodyblk].first, be = ranges[bodyblk].second;
         // 出口块：
         //   反转：从 hb+1 到 bodyblk-1 的所有块（返回代码）合并为一个"出口"
@@ -122,8 +127,12 @@ static bool closed_form_loops(IrFunc& f) {
         };
         for (int i = hs + 1; i < he - 1; i++)
             if (f.insns[i].op != IROp::LABEL && !ispure(f.insns[i].op)) { pure = false; break; }
+        // 体块必须是"单块"：无任何 LABEL（嵌套循环/条件必然引入 LABEL → 不闭合）。
+        // 这是关键安全条件，防止把嵌套循环当单块纯循环闭合。
         for (int i = bs; i < be - 1; i++)
-            if (f.insns[i].op != IROp::LABEL && !ispure(f.insns[i].op)) { pure = false; break; }
+            if (f.insns[i].op == IROp::LABEL) { pure = false; break; }
+        for (int i = bs; i < be - 1; i++)
+            if (!ispure(f.insns[i].op)) { pure = false; break; }
         if (!pure) continue;
 
         // 找归纳变量 iv 与步长 s。
@@ -337,7 +346,6 @@ static bool closed_form_loops(IrFunc& f) {
             int d = f.insns[i].d;
             if (d >= 0 && d != iv && live_after.count(d)) cands.push_back(d);
         }
-
         // 线性分析：对每个候选 acc，计算 (c_iv, c_acc, B)
         // 记录 (acc, ci, B)：每迭代增量 = ci*iv + B
         std::vector<std::tuple<int, long long, long long>> acc_deltas;
@@ -353,8 +361,8 @@ static bool closed_form_loops(IrFunc& f) {
                     if (v == acc) { ci = 0; ca = 1; B = 0; return true; }
                     auto it = form.find(v);
                     if (it != form.end()) { std::tie(ci, ca, B) = it->second; return true; }
-                    long long c;
-                    if (eval_const_before(f, v, i, c)) { ci = 0; ca = 0; B = c; return true; }
+                    // 只允许编译期常量（CONST/gconsts）。不能用 eval_const_before 解析任意外层 vreg：
+                    // 外层变量可能在嵌套循环中被修改，其"当前值"对闭合式不可靠（会导致错误闭合嵌套循环）。
                     if (auto gc = gconsts.find(v); gc != gconsts.end()) { ci = 0; ca = 0; B = gc->second; return true; }
                     return false;   // 其它符号 → 无法闭合
                 };
