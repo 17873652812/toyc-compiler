@@ -6,6 +6,7 @@
 # 三者一致 = PASS。任何不一致或崩溃 = FAIL。
 cd "$(dirname "$0")/.." || exit 1
 COMPILER=./compiler.exe
+[ -x "$COMPILER" ] || COMPILER="C:/Users/jiure/Desktop/tcc.exe"
 SIM=./perf/riscv_sim.exe
 NATDIR=$(mktemp -d 2>/dev/null || echo /tmp/toyc_native)
 mkdir -p "$NATDIR"

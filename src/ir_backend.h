@@ -12,6 +12,7 @@
 
 #include "ast.h"
 #include <algorithm>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -99,6 +100,8 @@ public:
         scopes_.clear();
         scopes_.push_back({});
         loops_.clear();
+        local_const_.clear();
+        local_invalidated_.clear();
         for (auto& p : func->params) {
             int s = new_vreg();
             scopes_.back()[p] = s;
@@ -115,6 +118,8 @@ private:
     std::unordered_map<std::string, int> global_const_;
     std::unordered_set<std::string> global_names_;
     std::unordered_set<std::string> global_invalidated_;  // 被赋值过的全局（常量失效）
+    std::unordered_map<std::string, int> local_const_;    // 局部常量 → 值（跨块折叠）
+    std::unordered_set<std::string> local_invalidated_;   // 被赋值过的局部常量
     int next_vreg_ = 0, next_label_ = 0;
     IrFunc cur_;
     std::vector<std::unordered_map<std::string, int>> scopes_;  // 变量 → 槽寄存器
@@ -131,6 +136,45 @@ private:
             if (it != scopes_[i].end()) return it->second;
         }
         return -1;
+    }
+
+    // 局部常量表达式求值（解析数字/局部常量/全局常量/算术），失败返回 nullopt
+    std::optional<int> eval_local_const(const ASTNode* e) const {
+        if (auto* num = dynamic_cast<const NumberExpr*>(e)) return num->value;
+        if (auto* id = dynamic_cast<const IdExpr*>(e)) {
+            auto li = local_const_.find(id->name);
+            if (li != local_const_.end() && !local_invalidated_.count(id->name)) return li->second;
+            auto gi = global_const_.find(id->name);
+            if (gi != global_const_.end() && !global_invalidated_.count(id->name)) return gi->second;
+            return std::nullopt;
+        }
+        if (auto* un = dynamic_cast<const UnaryExpr*>(e)) {
+            auto v = eval_local_const(un->expr.get());
+            if (!v) return std::nullopt;
+            if (un->op == "-") return -*v;
+            if (un->op == "+") return *v;
+            if (un->op == "!") return (*v == 0) ? 1 : 0;
+            return std::nullopt;
+        }
+        if (auto* bin = dynamic_cast<const BinaryExpr*>(e)) {
+            auto l = eval_local_const(bin->left.get());
+            auto r = eval_local_const(bin->right.get());
+            if (!l || !r) return std::nullopt;
+            const std::string& op = bin->op;
+            if (op == "+") return *l + *r;
+            if (op == "-") return *l - *r;
+            if (op == "*") return *l * *r;
+            if (op == "/") { if (*r == 0) return std::nullopt; return *l / *r; }
+            if (op == "%") { if (*r == 0) return std::nullopt; return *l % *r; }
+            if (op == "<") return *l < *r ? 1 : 0;
+            if (op == ">") return *l > *r ? 1 : 0;
+            if (op == "<=") return *l <= *r ? 1 : 0;
+            if (op == ">=") return *l >= *r ? 1 : 0;
+            if (op == "==") return *l == *r ? 1 : 0;
+            if (op == "!=") return *l != *r ? 1 : 0;
+            return std::nullopt;
+        }
+        return std::nullopt;
     }
 
     // 全局常量表达式求值（只允许常量算术）
@@ -169,8 +213,17 @@ private:
             return d;
         }
         if (auto* id = dynamic_cast<const IdExpr*>(e)) {
+            // 局部常量（跨块折叠）：值恒定且未被赋值 → 直接 CONST
+            {
+                auto lc = local_const_.find(id->name);
+                if (lc != local_const_.end() && !local_invalidated_.count(id->name)) {
+                    int d = new_vreg();
+                    emit({IROp::CONST, d, -1, -1, lc->second});
+                    return d;
+                }
+            }
             int slot = find_var(id->name);
-            if (slot >= 0) return slot;   // 局部变量/常量 → 直接读槽
+            if (slot >= 0) return slot;   // 局部变量 → 直接读槽
             auto gc = global_const_.find(id->name);
             if (gc != global_const_.end() && !global_invalidated_.count(id->name)) {
                 int d = new_vreg();
@@ -279,11 +332,16 @@ private:
         if (auto* cd = dynamic_cast<const ConstDecl*>(s)) {
             int slot = new_vreg();
             scopes_.back()[cd->name] = slot;
+            // 若初值可编译期求值 → 记录跨块常量（后续读取直接折叠）
+            if (auto v = eval_local_const(cd->init.get()))
+                local_const_[cd->name] = *v;
             int v = lower_expr(cd->init.get());
             emit({IROp::MOV, slot, v});
             return;
         }
         if (auto* as = dynamic_cast<const AssignStmt*>(s)) {
+            // 给局部常量赋值 → 常量失效（转回普通变量槽）
+            if (local_const_.count(as->name)) local_invalidated_.insert(as->name);
             int slot = find_var(as->name);
             if (slot >= 0) {
                 int v = lower_expr(as->expr.get());
@@ -545,27 +603,32 @@ static bool copy_prop_bb(IrFunc& f, int s, int e) {
         };
         repl(in.a); repl(in.b);
         for (auto& a : in.args) repl(a);
-        // 定义：若重定义了某个源，相关副本失效
+        // 定义：in.d 被重定义 → ① 以 in.d 为源的副本失效；② cpy[in.d] 自身失效
+        //（非 MOV 重定义会让 cpy[in.d] 变陈旧，必须清除）
         if (in.d >= 0) {
             for (auto it = cpy.begin(); it != cpy.end();)
-                if (it->second == in.d) it = cpy.erase(it); else ++it;
+                if (it->second == in.d || it->first == in.d) it = cpy.erase(it); else ++it;
             if (in.op == IROp::MOV && in.a >= 0) {
                 int src = resolve(in.a);
-                if (src >= 0) cpy[in.d] = src;
+                if (src >= 0 && src != in.d) cpy[in.d] = src;
             }
         }
     }
     return changed;
 }
 
-// 公共子表达式消除（基本块内）：纯运算结果复用；LOAD 遇 STORE/CALL 失效
+// 公共子表达式消除（基本块内）：纯运算结果复用。
+// 关键：缓存项的操作数被重新定义（槽重赋值）时缓存失效，否则会复用陈旧值。
+// LOAD 缓存遇 STORE/CALL 也失效（内存可能被改）。
 static bool cse_bb(IrFunc& f, int s, int e) {
+    struct Entry { std::string key; int res; int op1, op2; bool load; };
+    std::vector<Entry> tab;
     bool changed = false;
-    std::unordered_map<std::string, int> tab;
     for (int i = s; i < e; i++) {
         Insn& in = f.insns[i];
         std::string key;
         bool pure = true;
+        bool is_load = false;
         switch (in.op) {
         case IROp::CONST: key = "C," + std::to_string(in.imm); break;
         case IROp::ADD: key = "A," + std::to_string(in.a) + "," + std::to_string(in.b); break;
@@ -581,21 +644,34 @@ static bool cse_bb(IrFunc& f, int s, int e) {
         case IROp::SEQZ: key = "Z," + std::to_string(in.a); break;
         case IROp::SNEZ: key = "z," + std::to_string(in.a); break;
         case IROp::LA: key = "G," + in.name; break;
-        case IROp::LOAD: key = "X," + std::to_string(in.a) + "," + std::to_string(in.imm); break;
+        case IROp::LOAD: key = "X," + std::to_string(in.a) + "," + std::to_string(in.imm); is_load = true; break;
         default: pure = false;
         }
         if (pure && in.d >= 0) {
-            auto it = tab.find(key);
-            if (it != tab.end() && it->second != in.d) {
-                in.op = IROp::MOV; in.a = it->second; in.b = -1; in.imm = 0;
-                changed = true;
-            } else {
-                tab[key] = in.d;
+            bool found = false;
+            for (const Entry& en : tab) {
+                if (en.key == key) {
+                    if (en.res != in.d) {
+                        in.op = IROp::MOV; in.a = en.res; in.b = -1; in.imm = 0;
+                        changed = true;
+                    }
+                    found = true;
+                    break;
+                }
             }
+            if (!found) tab.push_back({key, in.d, in.a, in.b, is_load});
         }
+        // 失效：本指令定义 in.d → 清除所有用到 in.d 的缓存（避免陈旧复用）
+        if (in.d >= 0) {
+            tab.erase(std::remove_if(tab.begin(), tab.end(), [&](const Entry& en) {
+                return en.op1 == in.d || en.op2 == in.d;
+            }), tab.end());
+        }
+        // 失效：STORE/CALL 可能改内存 → 清除 LOAD 缓存
         if (in.op == IROp::STORE || in.op == IROp::CALL) {
-            for (auto it = tab.begin(); it != tab.end();)
-                if (it->first[0] == 'X') it = tab.erase(it); else ++it;
+            tab.erase(std::remove_if(tab.begin(), tab.end(), [](const Entry& en) {
+                return en.load;
+            }), tab.end());
         }
     }
     return changed;
