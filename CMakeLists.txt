@@ -12,4 +12,5 @@ add_executable(compiler
     src/ast.h
     src/parser.h
     src/codegen.h
+    src/ir_backend.h
 )
