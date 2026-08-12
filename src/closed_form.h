@@ -36,7 +36,7 @@ static bool closed_form_loops(IrFunc& f) {
     bool changed = false;
     for (int hb = 0; hb + 2 < nb; hb++) {
         int hs = ranges[hb].first, he = ranges[hb].second;
-        if (f.insns[hs].op != IROp::LABEL) continue;
+        if (f.insns[hs].op != IROp::LABEL) { continue; }
         IROp hterm = f.insns[he - 1].op;
         // 支持三种头分支：融合后的 BGE/BLT，以及 SLT/SLTI+BZ/BNZ（未融合，立即数比较）
         if (hterm != IROp::BGE && hterm != IROp::BLT &&
@@ -54,6 +54,7 @@ static bool closed_form_loops(IrFunc& f) {
             if (f.insns[ei].op == IROp::BR && f.insns[ei].label == header_label) { bodyblk = bi; break; }
         }
         if (bodyblk < 0) continue;
+
         bool inverted = (bodyblk == hb + 2);
         int exitblk = inverted ? (hb + 1) : (hb + 2);
 
@@ -111,42 +112,71 @@ static bool closed_form_loops(IrFunc& f) {
         if (!pure) continue;
 
         // 找归纳变量 iv 与步长 s。
+        // 关键：iv 必须出现在头块条件分支里。若体块有多个自增 vreg（累加器+归纳变量），
+        // 先收集所有候选，再选"出现在条件分支操作数里"的那个。
         // 形态 1：`iv = iv ± const`
-        // 形态 2（尾递归/临时链）：`temp = iv ± const; mv iv, temp` 或 `mv iv, temp; temp = iv ± const` 已折叠
-        int iv = -1; long long step = 0;
+        // 形态 2（尾递归/临时链）：`temp = iv ± const; mv iv, temp`
+        std::vector<std::pair<int, long long>> ivcands;   // (vreg, step)
         for (int i = bs; i < be - 1; i++) {
             const Insn& in = f.insns[i];
             if (in.d < 0) continue;
-            if (in.op == IROp::ADDI && in.a == in.d) { iv = in.d; step = in.imm; }
+            long long st = 0; bool isiv = false;
+            if (in.op == IROp::ADDI && in.a == in.d) { st = in.imm; isiv = true; }
             else if (in.op == IROp::SUB && in.a == in.d) {
                 long long c;
-                if (eval_const_before(f, in.b, i, c)) { iv = in.d; step = -c; }
+                if (eval_const_before(f, in.b, i, c)) { st = -c; isiv = true; }
             } else if (in.op == IROp::ADD && in.a == in.d) {
                 long long c;
-                if (eval_const_before(f, in.b, i, c)) { iv = in.d; step = c; }
+                if (eval_const_before(f, in.b, i, c)) { st = c; isiv = true; }
             } else if (in.op == IROp::MOV && in.a != in.d) {
-                // iv = temp；temp 由 `temp = iv ± const` 定义（循环体内）
                 for (int j = bs; j < i; j++) {
                     const Insn& jin = f.insns[j];
                     if (jin.d != in.a) continue;
-                    if (jin.op == IROp::ADDI && jin.a == in.d) { iv = in.d; step = jin.imm; }
+                    if (jin.op == IROp::ADDI && jin.a == in.d) { st = jin.imm; isiv = true; }
                     else if (jin.op == IROp::ADD && jin.a == in.d) {
                         long long c;
-                        if (eval_const_before(f, jin.b, j, c)) { iv = in.d; step = c; }
+                        if (eval_const_before(f, jin.b, j, c)) { st = c; isiv = true; }
                     }
                     break;
                 }
             }
-            if (iv >= 0) break;
+            if (isiv && st != 0) ivcands.push_back({in.d, st});
         }
-        if (iv < 0 || step == 0) continue;
+        // 选条件分支里的那个作为 iv。
+        // BGE/BLT：iv 直接是分支操作数之一。
+        // BZ/BNZ：分支操作数是 SLT/SLTI 结果，iv 在定义该结果的比较指令里。
+        const Insn& hcv = f.insns[he - 1];
+        int iv = -1; long long step = 0;
+        if (hcv.op == IROp::BGE || hcv.op == IROp::BLT) {
+            for (auto& [v, st] : ivcands)
+                if (hcv.a == v || hcv.b == v) { iv = v; step = st; break; }
+        } else {
+            // 找定义分支操作数的 SLT/SLTI/SEQZ 链，取其中出现的候选 iv
+            int condv = hcv.a;
+            int defi = -1;
+            for (int i = he - 2; i >= hs; i--)
+                if (f.insns[i].d == condv) { defi = i; break; }
+            if (defi < 0) continue;
+            int cand_operand = -1;
+            if (f.insns[defi].op == IROp::SEQZ) {
+                int slt_i = -1;
+                for (int i = defi - 1; i >= hs; i--)
+                    if (f.insns[i].d == f.insns[defi].a) { slt_i = i; break; }
+                if (slt_i >= 0) cand_operand = slt_i;
+            } else cand_operand = defi;
+            if (cand_operand < 0) continue;
+            const Insn& cmpin = f.insns[cand_operand];
+            for (auto& [v, st] : ivcands)
+                if (cmpin.a == v || cmpin.b == v) { iv = v; step = st; break; }
+        }
+        if (iv < 0) continue;
         int ivcnt = 0;
         for (int i = bs; i < be - 1; i++) if (f.insns[i].d == iv) ivcnt++;
         if (ivcnt != 1) continue;   // iv 只被增量定义一次
 
         // 条件分支必须用到 iv，另一个操作数必须是常数边界 N
         // cmp：0=iv<N,1=iv<=N,2=iv>N,3=iv>=N
-        const Insn& hc = f.insns[he - 1];
+        const Insn& hc = hcv;
         int cmp = -1; long long N = 0;
         if (hterm == IROp::BGE || hterm == IROp::BLT) {
             if (hc.a != iv && hc.b != iv) continue;
@@ -228,7 +258,7 @@ static bool closed_form_loops(IrFunc& f) {
                 }
             }
         }
-        if (cmp < 0) continue;
+
         // 反转布局：条件分支跳进循环体（continue），fall-through 是出口。
         // 语义正好相反：正常布局里"分支=出口"，反转里"分支=继续循环"。
         if (inverted) cmp = 3 - cmp;   // iv<N↔iv>=N, iv<=N↔iv>N
