@@ -1077,14 +1077,16 @@ struct RegAlloc {
         select_spill(allv, 17);
 
         // 分配：跨调用 → S；非跨调用 → T 然后 S。一个 vreg 整个函数一个物理寄存器。
+        // 关键：两个池共用同一个 owner 数组——否则第二个池会抢第一个池已占的寄存器
+        // （重叠存活区间的 vreg 被分到同一物理寄存器，导致错误输出）。
+        int owner[32];
+        for (int i = 0; i < 32; i++) owner[i] = -1;
         auto assign_pool = [&](const std::vector<int>& vregs, const std::vector<int>& pool) {
             std::vector<int> ord = vregs;
             std::sort(ord.begin(), ord.end(), [&](int x, int y) {
                 if (first_pt[x] != first_pt[y]) return first_pt[x] < first_pt[y];
                 return last_pt[x] < last_pt[y];
             });
-            int owner[32];
-            for (int i = 0; i < 32; i++) owner[i] = -1;
             for (int v : ord) {
                 if (spill.count(v)) continue;
                 for (int p = 0; p < 32; p++)
