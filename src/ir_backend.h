@@ -976,6 +976,20 @@ static void strength_reduce(IrFunc& f) {
         if (lb > (int)bi) continue;
         if (bi != lb && bi != lb + 1) continue;   // 单块或两块循环（条件块 + 体块）
         int s = ranges[lb].first, e = ranges[bi].second;
+        // 寄存器压力估算：循环内引用的不同 vreg 数（含外部 live-in）。
+        // 归纳变量 t/tN 需 +2 个长存活寄存器，若已接近 17 上限则跳过
+        // （否则循环溢出 lw/sw 得不偿失，p08 的 17 变量循环即此情况）。
+        {
+            std::unordered_set<int> lv;
+            for (int i = s; i < e; i++) {
+                const Insn& in = f.insns[i];
+                if (in.d >= 0) lv.insert(in.d);
+                if (in.a >= 0) lv.insert(in.a);
+                if (in.b >= 0) lv.insert(in.b);
+                for (int v : in.args) lv.insert(v);
+            }
+            if ((int)lv.size() + 2 > 16) continue;
+        }
         // 简单检查：无调用/内存/RET/嵌套条件分支。循环条件的 BGE/BLT 允许（最多 1 个）。
         bool simple = true;
         int cond_cnt = 0;
@@ -1066,7 +1080,7 @@ static void optimize_ir(IrFunc& f) {
         fuse_cmp_branch(f);                // SLT+BZ/BNZ → BLT/BGE（省 1 条/循环迭代）
         licm_const(f);                     // 循环内常量外提
         dce(f);
-        // strength_reduce(f);                // 归纳变量强度削减
+        strength_reduce(f);                // 归纳变量强度削减（带寄存器压力检查）
         dce(f);
         if (!changed) break;
     }
