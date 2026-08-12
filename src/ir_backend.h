@@ -1066,7 +1066,7 @@ static void optimize_ir(IrFunc& f) {
         fuse_cmp_branch(f);                // SLT+BZ/BNZ → BLT/BGE（省 1 条/循环迭代）
         licm_const(f);                     // 循环内常量外提
         dce(f);
-        strength_reduce(f);                // 归纳变量强度削减（mul→归纳 add）
+        // strength_reduce(f);                // 归纳变量强度削减
         dce(f);
         if (!changed) break;
     }
