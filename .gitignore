@@ -2,3 +2,4 @@ compiler.exe
 build/
 perf/riscv_sim.exe
 perf/.reg
+.claude/
