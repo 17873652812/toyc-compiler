@@ -1045,6 +1045,94 @@ static const char* REGNAME[32] = {
 };
 static std::string regname(int p) { return REGNAME[p]; }
 
+// 计算每个 vreg 的 spill weight：按所在块的循环深度加权使用次数。
+// 循环深度越深、使用越多的值 weight 越高 → 溢出决策时优先保留（避免热循环值溢出到栈）。
+static std::unordered_map<int, int> compute_spill_weight(const IrFunc& f) {
+    auto ranges = bb_ranges(f);
+    int nb = (int)ranges.size();
+    std::unordered_map<int, int> weight;
+    if (nb < 2) {
+        for (const Insn& in : f.insns) {
+            if (in.a >= 0) weight[in.a]++;
+            if (in.b >= 0) weight[in.b]++;
+            for (int v : in.args) weight[v]++;
+        }
+        return weight;
+    }
+    std::vector<int> blk_of(f.insns.size());
+    for (int bi = 0; bi < nb; bi++)
+        for (int i = ranges[bi].first; i < ranges[bi].second; i++)
+            blk_of[i] = bi;
+    // CFG + 支配者
+    std::unordered_map<int, int> lbl2blk;
+    for (int bi = 0; bi < nb; bi++)
+        for (int i = ranges[bi].first; i < ranges[bi].second; i++)
+            if (f.insns[i].op == IROp::LABEL) lbl2blk[f.insns[i].label] = bi;
+    std::vector<std::vector<int>> pred(nb), succ(nb);
+    for (int bi = 0; bi < nb; bi++) {
+        int last = ranges[bi].second - 1;
+        IROp op = f.insns[last].op;
+        auto link = [&](int a, int b) { succ[a].push_back(b); pred[b].push_back(a); };
+        if (op == IROp::BZ || op == IROp::BNZ || op == IROp::BLT || op == IROp::BGE) {
+            auto it = lbl2blk.find(f.insns[last].label);
+            if (it != lbl2blk.end()) link(bi, it->second);
+            if (bi + 1 < nb) link(bi, bi + 1);
+        } else if (op == IROp::BR) {
+            auto it = lbl2blk.find(f.insns[last].label);
+            if (it != lbl2blk.end()) link(bi, it->second);
+        } else if (op != IROp::RET && bi + 1 < nb) {
+            link(bi, bi + 1);
+        }
+    }
+    std::vector<std::unordered_set<int>> dom(nb);
+    dom[0].insert(0);
+    for (int bi = 1; bi < nb; bi++) for (int i = 0; i < nb; i++) dom[bi].insert(i);
+    bool ch = true;
+    while (ch) {
+        ch = false;
+        for (int bi = 1; bi < nb; bi++) {
+            std::unordered_set<int> nd;
+            if (pred[bi].empty()) nd.insert(bi);
+            else {
+                nd = dom[pred[bi][0]];
+                for (size_t pi = 1; pi < pred[bi].size(); pi++) {
+                    std::unordered_set<int> inter;
+                    for (int v : nd) if (dom[pred[bi][pi]].count(v)) inter.insert(v);
+                    nd = std::move(inter);
+                }
+                nd.insert(bi);
+            }
+            if (nd != dom[bi]) { dom[bi] = std::move(nd); ch = true; }
+        }
+    }
+    // 块循环深度：回边 → 自然循环内的块深度 +1
+    std::vector<int> depth(nb, 0);
+    for (int u = 0; u < nb; u++)
+        for (int v : succ[u]) {
+            if (!dom[u].count(v)) continue;
+            std::vector<char> lb(nb, 0);
+            std::vector<int> st = {u}; lb[u] = 1;
+            while (!st.empty()) {
+                int x = st.back(); st.pop_back();
+                for (int p : pred[x]) {
+                    if (p == v) continue;
+                    if (dom[p].count(v) && !lb[p]) { lb[p] = 1; st.push_back(p); }
+                }
+            }
+            lb[v] = 1;
+            for (int bi = 0; bi < nb; bi++) if (lb[bi]) depth[bi]++;
+        }
+    // 使用加权
+    for (size_t i = 0; i < f.insns.size(); i++) {
+        const Insn& in = f.insns[i];
+        int mul = 1 + depth[blk_of[i]];
+        if (in.a >= 0) weight[in.a] += mul;
+        if (in.b >= 0) weight[in.b] += mul;
+        for (int v : in.args) weight[v] += mul;
+    }
+    return weight;
+}
+
 struct RegAlloc {
     std::unordered_map<int, int> phys;    // 虚拟寄存器 → 物理寄存器号
     std::unordered_set<int> spilled;      // 溢出的虚拟寄存器
@@ -1079,8 +1167,9 @@ struct RegAlloc {
             if (d >= 0) mark(d);
         }
 
-        // 溢出选择（sweep）：按 start 处理，超容量时溢出"最晚结束"的活跃 vreg
-        // （长生命周期的槽寄存器优先被溢出，让短生命周期的临时值留在寄存器里）
+        // 溢出选择（sweep）：按 start 处理，超容量时溢出"spill weight 最小"的活跃 vreg。
+        // spill weight = 循环深度加权使用次数 → 热循环里的值权重高被保留，冷值被溢出。
+        std::unordered_map<int, int> spill_weight = compute_spill_weight(f);
         std::unordered_set<int> spill;
         auto select_spill = [&](const std::vector<int>& vregs, int cap) {
             std::vector<int> ord = vregs;
@@ -1088,16 +1177,17 @@ struct RegAlloc {
                 if (first_pt[x] != first_pt[y]) return first_pt[x] < first_pt[y];
                 return last_pt[x] < last_pt[y];
             });
-            std::vector<std::pair<int, int>> active;   // (last_pt, vreg)
+            std::vector<int> active;   // 活跃 vreg
             for (int v : ord) {
                 if (spill.count(v)) continue;   // 已在溢出集
                 active.erase(std::remove_if(active.begin(), active.end(),
-                    [&](const auto& pr) { return pr.first < first_pt[v]; }), active.end());
-                active.push_back({last_pt[v], v});
+                    [&](int x) { return last_pt[x] < first_pt[v]; }), active.end());
+                active.push_back(v);
                 while ((int)active.size() > cap) {
-                    auto it = std::max_element(active.begin(), active.end(),
-                        [](const auto& a, const auto& b) { return a.first < b.first; });
-                    spill.insert(it->second);
+                    // 溢出 weight 最小的（热循环值权重高，保留）
+                    auto it = std::min_element(active.begin(), active.end(),
+                        [&](int x, int y) { return spill_weight[x] < spill_weight[y]; });
+                    spill.insert(*it);
                     active.erase(it);
                 }
             }
