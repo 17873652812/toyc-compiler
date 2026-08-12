@@ -36,7 +36,7 @@ static bool closed_form_loops(IrFunc& f) {
     bool changed = false;
     for (int hb = 0; hb + 2 < nb; hb++) {
         int hs = ranges[hb].first, he = ranges[hb].second;
-        if (f.insns[hs].op != IROp::LABEL) { continue; }
+        if (f.insns[hs].op != IROp::LABEL) continue;
         IROp hterm = f.insns[he - 1].op;
         // 支持三种头分支：融合后的 BGE/BLT，以及 SLT/SLTI+BZ/BNZ（未融合，立即数比较）
         if (hterm != IROp::BGE && hterm != IROp::BLT &&
@@ -48,32 +48,45 @@ static bool closed_form_loops(IrFunc& f) {
         //   正常：头块条件分支→出口；体块 hb+1 以 BR 回头块；出口 hb+2 以标签开头
         //   反转：头块条件分支→体块；出口 hb+1 为 fall-through（返回代码）；体块 hb+2
         // 先找"以 BR 回头块标签结尾"的块 → 那就是体块
+        // 体块 = 以 BR 回头块标签结尾的块（可能在 hb+1..hb+3，因空标签块可能拆分）
         int bodyblk = -1;
-        for (int bi = hb + 1; bi <= hb + 2 && bi < nb; bi++) {
+        for (int bi = hb + 1; bi < nb && bi <= hb + 3; bi++) {
             int ei = ranges[bi].second - 1;
             if (f.insns[ei].op == IROp::BR && f.insns[ei].label == header_label) { bodyblk = bi; break; }
         }
         if (bodyblk < 0) continue;
 
-        bool inverted = (bodyblk == hb + 2);
-        int exitblk = inverted ? (hb + 1) : (hb + 2);
-
-        // 分支目标必须指向：正常→出口块首标签；反转→体块首标签
+        // 分支目标块：决定布局
         int tgtblk = -1;
         for (int bi = 0; bi < nb; bi++)
             for (int i = ranges[bi].first; i < ranges[bi].second; i++)
                 if (f.insns[i].op == IROp::LABEL && f.insns[i].label == brtgt) tgtblk = bi;
         if (tgtblk < 0) continue;
-        if (inverted) { if (tgtblk != bodyblk) continue; }
-        else           { if (tgtblk != exitblk) continue; }
+        // 反转布局：分支目标在体块或其前面的标签块（tgtblk <= bodyblk），
+        //   出口在 hb+1..bodyblk-1 之间（fall-through 返回代码）
+        // 正常布局：分支目标 = 出口（tgtblk == bodyblk+1，即紧跟在体块之后）
+        bool inverted = (tgtblk <= bodyblk);
+        if (!inverted && tgtblk != bodyblk + 1) continue;
+        // 反转布局里，分支目标块若只是空标签块，其实际代码在下一个非空块——体块就在其后
+        if (inverted && tgtblk < hb + 1) continue;
 
         int bs = ranges[bodyblk].first, be = ranges[bodyblk].second;
-        int es = ranges[exitblk].first, ee = ranges[exitblk].second;
-
-        // 出口块（反转布局里是返回代码）必须简单：无 CALL/STORE/LOAD/LA，且以 BR/RET 结束
+        // 出口块：
+        //   反转：从 hb+1 到 bodyblk-1 的所有块（返回代码）合并为一个"出口"
+        //   正常：bodyblk+1（分支目标块）
+        int es = -1, ee = -1;
         if (inverted) {
-            IROp eterm = f.insns[ee - 1].op;
+            es = ranges[hb + 1].first;
+            ee = ranges[bodyblk].first;   // 到体块前为止
+            if (es >= ee) continue;
+            // 出口块必须简单且以 BR/RET 结束（跳过结尾的空标签块）
+            int eterm_i = ee - 1;
+            while (eterm_i > es && f.insns[eterm_i].op == IROp::LABEL) eterm_i--;
+            IROp eterm = f.insns[eterm_i].op;
             if (eterm != IROp::BR && eterm != IROp::RET) continue;
+        } else {
+            es = ranges[bodyblk + 1].first;
+            ee = ranges[bodyblk + 1].second;
         }
 
         // header 标签只能被回边引用一次（无 continue/外层跳入）
@@ -107,8 +120,10 @@ static bool closed_form_loops(IrFunc& f) {
             default: return false;
             }
         };
-        for (int i = hs + 1; i < he - 1; i++) if (!ispure(f.insns[i].op)) { pure = false; break; }
-        for (int i = bs; i < be - 1; i++) if (!ispure(f.insns[i].op)) { pure = false; break; }
+        for (int i = hs + 1; i < he - 1; i++)
+            if (f.insns[i].op != IROp::LABEL && !ispure(f.insns[i].op)) { pure = false; break; }
+        for (int i = bs; i < be - 1; i++)
+            if (f.insns[i].op != IROp::LABEL && !ispure(f.insns[i].op)) { pure = false; break; }
         if (!pure) continue;
 
         // 找归纳变量 iv 与步长 s。
@@ -258,32 +273,49 @@ static bool closed_form_loops(IrFunc& f) {
                 }
             }
         }
+        if (cmp < 0) continue;
 
         // 反转布局：条件分支跳进循环体（continue），fall-through 是出口。
         // 语义正好相反：正常布局里"分支=出口"，反转里"分支=继续循环"。
         if (inverted) cmp = 3 - cmp;   // iv<N↔iv>=N, iv<=N↔iv>N
 
-        // iv 初值 i0
+        // iv 初值 i0（编译期常量）
         long long i0 = 0;
-        if (!eval_const_before(f, iv, hs, i0)) continue;
+        bool i0_const = eval_const_before(f, iv, hs, i0);
+        // 若 iv 初值不是常量，但能找到其来源 vreg（形参/前面计算）→ 运行时闭合式
+        int i0v = -1;
+        if (!i0_const) {
+            // 若 iv 是形参，初值就是形参本身
+            for (int p : f.params) if (p == iv) { i0v = iv; break; }
+            if (i0v < 0) {
+                for (int i = hs - 1; i >= 0; i--)
+                    if (f.insns[i].d == iv) { if (f.insns[i].op == IROp::MOV) i0v = f.insns[i].a; break; }
+            }
+        }
 
         // 迭代次数 T
         long long T = 0;
-        {
+        bool T_ok = true;
+        if (i0_const) {
             if (cmp == 0) {
                 if (step > 0) { if (i0 >= N) T = 0; else T = (N - i0 + step - 1) / step; }
-                else { if (i0 < N) T = 0; else continue; }
+                else T_ok = false;
             } else if (cmp == 1) {
                 if (step > 0) { if (i0 > N) T = 0; else T = (N - i0) / step + 1; }
-                else { if (i0 <= N) T = 0; else continue; }
+                else T_ok = false;
             } else if (cmp == 2) {
                 if (step < 0) { if (i0 <= N) T = 0; else T = (i0 - N + (-step) - 1) / (-step); }
-                else { if (i0 > N) T = 0; else continue; }
+                else T_ok = false;
             } else {
                 if (step < 0) { if (i0 < N) T = 0; else T = (i0 - N) / (-step) + 1; }
-                else { if (i0 >= N) T = 0; else continue; }
+                else T_ok = false;
             }
+        } else {
+            // 运行时闭合式（i0 为参数）暂缓：先只做编译期可算的。
+            // 保留 i0v 供将来实现，当前一律跳过（循环保留，结果仍正确）。
+            T_ok = false;
         }
+        if (!T_ok) continue;
 
         // 收集循环后仍存活的 vreg。
         // 正常布局：体块之后（be 起）。反转布局：出口块在体块之前的位置也要算（它运行在循环之后）。
@@ -307,7 +339,8 @@ static bool closed_form_loops(IrFunc& f) {
         }
 
         // 线性分析：对每个候选 acc，计算 (c_iv, c_acc, B)
-        std::vector<std::pair<int, long long>> acc_deltas;   // (acc, 总增量)
+        // 记录 (acc, ci, B)：每迭代增量 = ci*iv + B
+        std::vector<std::tuple<int, long long, long long>> acc_deltas;
         bool ok = true;
         for (int acc : cands) {
             std::unordered_map<int, std::tuple<long long, long long, long long>> form;
@@ -398,9 +431,9 @@ static bool closed_form_loops(IrFunc& f) {
             if (it == form.end()) { ok = false; break; }
             auto [ci, ca, B] = it->second;
             if (ca != 1) { ok = false; break; }   // 必须纯累加（系数 1）
-            // 增量 = Σ_{k=0}^{T-1} (ci*(i0+k*step) + B)
-            long long inc = ci * T * i0 + ci * step * T * (T - 1) / 2 + B * T;
-            acc_deltas.push_back({acc, inc});
+            // 运行时闭合式只支持常数增量（ci==0）；否则编译期需 i0 常量
+            if (!i0_const && ci != 0) { ok = false; break; }
+            acc_deltas.push_back({acc, ci, B});
         }
         if (!ok) continue;
 
@@ -409,24 +442,28 @@ static bool closed_form_loops(IrFunc& f) {
         int fresh = 0;
         for (const Insn& in : f.insns) fresh = std::max(fresh, in.d + 1);
         for (int p : f.params) fresh = std::max(fresh, p + 1);
-        for (auto& [acc, inc] : acc_deltas) {
-            int t = fresh++;
-            int v = (int)(uint64_t)inc;   // 截断为 32 位
-            repl.push_back({IROp::CONST, t, -1, -1, v});
-            repl.push_back({IROp::ADD, acc, acc, t});
-        }
-        if (live_after.count(iv)) {
-            int t = fresh++;
-            long long delta = (long long)T * step;
-            int v = (int)(uint64_t)delta;
-            repl.push_back({IROp::CONST, t, -1, -1, v});
-            repl.push_back({IROp::ADD, iv, iv, t});
-        }
-        if (inverted) {
-            // 反转布局：出口块（返回代码）运行在循环之后，原样保留其指令
-            for (int i = es; i < ee; i++) repl.push_back(f.insns[i]);
-        } else {
-            repl.push_back({IROp::BR, -1, -1, -1, 0, brtgt});   // 正常布局：跳到出口
+        {
+            for (auto& [acc, ci, B] : acc_deltas) {
+                int t = fresh++;
+                // 编译期总增量 = Σ_{k=0}^{T-1}(ci*(i0+k*step)+B)
+                long long total = ci * T * i0 + ci * step * T * (T - 1) / 2 + B * T;
+                int v = (int)(uint64_t)total;
+                repl.push_back({IROp::CONST, t, -1, -1, v});
+                repl.push_back({IROp::ADD, acc, acc, t});
+            }
+            if (live_after.count(iv)) {
+                int t = fresh++;
+                long long delta = (long long)T * step;
+                int v = (int)(uint64_t)delta;
+                repl.push_back({IROp::CONST, t, -1, -1, v});
+                repl.push_back({IROp::ADD, iv, iv, t});
+            }
+            if (inverted) {
+                // 反转布局：出口块（返回代码）运行在循环之后，原样保留其指令
+                for (int i = es; i < ee; i++) repl.push_back(f.insns[i]);
+            } else {
+                repl.push_back({IROp::BR, -1, -1, -1, 0, brtgt});   // 正常布局：跳到出口
+            }
         }
         f.insns.erase(f.insns.begin() + hs, f.insns.begin() + be);
         f.insns.insert(f.insns.begin() + hs, repl.begin(), repl.end());
