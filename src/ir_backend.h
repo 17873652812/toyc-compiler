@@ -940,6 +940,118 @@ static void dce(IrFunc& f) {
     }
 }
 
+// ---------- 归纳变量强度削减 ----------
+
+static int max_vreg(const IrFunc& f) {
+    int m = -1;
+    auto upd = [&](int v) { if (v > m) m = v; };
+    for (const Insn& in : f.insns) { upd(in.d); upd(in.a); upd(in.b); for (int v : in.args) upd(v); }
+    for (int p : f.params) upd(p);
+    return m;
+}
+
+// 强度削减：识别循环 `MUL tmp, i, c`（c>0常量）且 i 是 +k 归纳变量，
+// 循环条件是 `i < N`。引入 t = c*i 归纳变量：
+//   - 循环前 li t,0；li tN, c*N
+//   - 循环里 MUL 换成读 t，条件换成 BGE t, tN，删除 ADDI i
+// 循环体从 (bge/mul/add/addi/j) 5 条 → (bge/add/addi/j) 4 条，且 mul 消失。
+// 只处理最干净的单块循环模式，否则跳过。
+static void strength_reduce(IrFunc& f) {
+    std::unordered_map<int, int> constval;
+    for (const Insn& in : f.insns)
+        if (in.op == IROp::CONST) constval[in.d] = in.imm;
+    auto ranges = bb_ranges(f);
+    std::unordered_map<int, int> lbl2blk;
+    for (size_t bi = 0; bi < ranges.size(); bi++)
+        for (int i = ranges[bi].first; i < ranges[bi].second; i++)
+            if (f.insns[i].op == IROp::LABEL) lbl2blk[f.insns[i].label] = (int)bi;
+    int next_vreg = max_vreg(f) + 1;
+
+    for (size_t bi = 0; bi < ranges.size(); bi++) {
+        int last = ranges[bi].second - 1;
+        if (last < 0 || f.insns[last].op != IROp::BR) continue;
+        auto it = lbl2blk.find(f.insns[last].label);
+        if (it == lbl2blk.end()) continue;
+        int lb = it->second;
+        if (lb > (int)bi) continue;
+        if (bi != lb && bi != lb + 1) continue;   // 单块或两块循环（条件块 + 体块）
+        int s = ranges[lb].first, e = ranges[bi].second;
+        // 简单检查：无调用/内存/RET/嵌套条件分支。循环条件的 BGE/BLT 允许（最多 1 个）。
+        bool simple = true;
+        int cond_cnt = 0;
+        for (int i = s; i < e; i++) {
+            IROp op = f.insns[i].op;
+            if (op == IROp::CALL || op == IROp::STORE || op == IROp::BZ ||
+                op == IROp::BNZ || op == IROp::RET) { simple = false; break; }
+            if (op == IROp::BGE || op == IROp::BLT) cond_cnt++;
+        }
+        if (!simple || cond_cnt != 1) continue;
+        // 归纳变量：ADDI i, i, k（k>0）
+        int ind = -1, inc = 0;
+        for (int i = s; i < e; i++) {
+            const Insn& in = f.insns[i];
+            if (in.op == IROp::ADDI && in.a == in.d && in.a >= 0 && in.imm > 0) { ind = in.d; inc = in.imm; }
+        }
+        if (ind < 0) continue;
+        // MUL tmp, ind, c（c CONST>0）
+        int mul_idx = -1, mul_tmp = -1, mul_c = 0;
+        for (int i = s; i < e; i++) {
+            const Insn& in = f.insns[i];
+            if (in.op == IROp::MUL && in.a == ind && in.b >= 0 &&
+                constval.count(in.b) && constval[in.b] > 0) {
+                mul_idx = i; mul_tmp = in.d; mul_c = constval[in.b];
+            }
+        }
+        if (mul_idx < 0) continue;
+        // 循环条件：BGE ind, N（N CONST>0），在循环体开头
+        int cond_idx = -1, cond_N = 0;
+        for (int i = s; i < e; i++) {
+            const Insn& in = f.insns[i];
+            if ((in.op == IROp::BGE || in.op == IROp::BLT) && in.a == ind &&
+                in.b >= 0 && constval.count(in.b)) {
+                // BLT i, N = i < N 跳转（进循环）；BGE i, N = i>=N 跳转（退出）
+                cond_idx = i; cond_N = constval[in.b];
+            }
+        }
+        if (cond_idx < 0) continue;
+        // 确认 i 初值 = 0
+        bool i0_zero = false;
+        for (int i = s - 1; i >= 0; i--) {
+            const Insn& in = f.insns[i];
+            if (in.op == IROp::MOV && in.d == ind) {
+                i0_zero = (constval.count(in.a) && constval[in.a] == 0);
+                break;
+            }
+        }
+        if (!i0_zero) continue;
+        // 检查 mul_tmp 是否只在循环体内被使用（替换成读 t 安全）
+        // （宽松：只要循环体内用到即可，regalloc 处理）
+        int t = next_vreg++, tN = next_vreg++;
+        // 循环头前插 li t,0; li tN, c*N
+        Insn c0(IROp::CONST, t, -1, -1, 0);
+        Insn cn(IROp::CONST, tN, -1, -1, mul_c * cond_N);
+        f.insns.insert(f.insns.begin() + s, c0);
+        f.insns.insert(f.insns.begin() + s + 1, cn);
+        // 循环体改写（位置偏移：s 后 +2）
+        for (int i = s + 2; i < (int)f.insns.size(); i++) {
+            Insn& in = f.insns[i];
+            if (in.op == IROp::MUL && in.a == ind && in.b >= 0 && constval.count(in.b)) {
+                in.op = IROp::MOV; in.a = t; in.b = -1;
+            } else if (in.op == IROp::BGE && in.a == ind) {
+                in.a = t; in.b = tN;
+            } else if (in.op == IROp::BLT && in.a == ind) {
+                in.a = t; in.b = tN;
+            } else if (in.op == IROp::ADDI && in.d == ind && in.a == ind) {
+                in.op = IROp::NOP;   // 删除 i += k
+                // 在 NOP 位置后补 t += c*k
+                Insn add_t(IROp::ADDI, t, t, -1, mul_c * inc);
+                f.insns.insert(f.insns.begin() + i + 1, add_t);
+                break;
+            }
+        }
+    }
+}
+
 // 主优化入口：多轮迭代到稳定
 static void optimize_ir(IrFunc& f) {
     for (int round = 0; round < 4; round++) {
@@ -953,6 +1065,8 @@ static void optimize_ir(IrFunc& f) {
         changed |= merge_mov_into_op(f);   // 消除赋值后的 mv
         fuse_cmp_branch(f);                // SLT+BZ/BNZ → BLT/BGE（省 1 条/循环迭代）
         licm_const(f);                     // 循环内常量外提
+        dce(f);
+        strength_reduce(f);                // 归纳变量强度削减（mul→归纳 add）
         dce(f);
         if (!changed) break;
     }
