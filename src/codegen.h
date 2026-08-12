@@ -39,8 +39,10 @@ public:
 
         out_ << ".text\n";
         // 不定义 _start —— 评测系统的 C 运行时会提供 _start 并调用 main
-        for (const auto& func : unit_.funcs)
+        for (const auto& func : unit_.funcs) {
+            funcs_[func->name] = func.get();   // 记录函数定义（内联用）
             gen_func(func.get());
+        }
         return out_.str();
     }
 
@@ -67,6 +69,8 @@ private:
 
     const CompUnit& unit_;
     bool opt_;
+    std::unordered_map<std::string, const FuncDef*> funcs_;  // 函数名→定义（-opt 内联用）
+    std::unordered_map<std::string, const ASTNode*> inline_args_;  // 内联形参名→实参 AST
     std::ostringstream out_;
     // 栈式作用域：每个 Block 进入时 push 一个作用域，离开时 pop
     std::vector<std::unordered_map<std::string, VarLoc>> symtab_{1};
@@ -683,6 +687,12 @@ private:
             }
         }
         if (auto* id = dynamic_cast<const IdExpr*>(expr)) {
+            // 内联：形参名 → 生成实参表达式（-opt）
+            auto ia = inline_args_.find(id->name);
+            if (ia != inline_args_.end()) {
+                gen_expr(ia->second);
+                return;
+            }
             // 查找顺序：常量 > 局部变量 > 全局变量
             int* cv = find_const(id->name);
             if (cv) { out_ << "    li t0, " << *cv << "\n"; return; }
@@ -815,8 +825,49 @@ private:
 
     // ---- 函数调用 ----
 
+    // -opt 内联：函数体是单条 return 表达式、无递归、参数匹配 → 直接展开
+    // （避免循环内频繁调用小函数的 call/ret 开销，是 p08 性能关键）
+    bool inline_call(const CallExpr* call) {
+        if (!opt_) return false;
+        auto it = funcs_.find(call->func_name);
+        if (it == funcs_.end()) return false;
+        const FuncDef* f = it->second;
+        if (f->name == current_func_) return false;             // 递归不内联
+        if (call->args.size() != f->params.size()) return false;
+        if (f->body->stmts.size() != 1) return false;           // 需单条语句
+        auto* ret = dynamic_cast<const ReturnStmt*>(f->body->stmts[0].get());
+        if (!ret || !ret->expr) return false;                    // 需 return expr;
+        if (funcs_calls_self(f)) return false;                  // 函数体内有递归不内联
+        // 绑定形参→实参（保存旧映射，支持嵌套内联）
+        auto saved = inline_args_;
+        inline_args_.clear();
+        for (size_t i = 0; i < f->params.size(); i++)
+            inline_args_[f->params[i]] = call->args[i].get();
+        gen_expr(ret->expr.get());                              // 展开 return 表达式
+        inline_args_ = saved;                                   // 恢复外层映射
+        return true;
+    }
+    // 函数体内是否直接调用自身（递归）
+    bool funcs_calls_self(const FuncDef* f) {
+        return stmt_contains_func(f->body.get(), f->name);
+    }
+    bool stmt_contains_func(const ASTNode* s, const std::string& name) {
+        if (auto* c = dynamic_cast<const CallExpr*>(s)) {
+            if (c->func_name == name) return true;
+            for (auto& a : c->args) if (stmt_contains_func(a.get(), name)) return true;
+            return false;
+        }
+        if (auto* b = dynamic_cast<const BinaryExpr*>(s))
+            return stmt_contains_func(b->left.get(), name) || stmt_contains_func(b->right.get(), name);
+        if (auto* u = dynamic_cast<const UnaryExpr*>(s)) return stmt_contains_func(u->expr.get(), name);
+        if (auto* r = dynamic_cast<const ReturnStmt*>(s)) return r->expr && stmt_contains_func(r->expr.get(), name);
+        return false;
+    }
+
     void gen_call(const CallExpr* call) {
         int n = (int)call->args.size();
+        // -opt：可内联的小函数直接展开（跳过 call/ret/帧开销）
+        if (inline_call(call)) return;
         // 先求值所有参数存到临时区（避免求值后面的参数破坏前面已求值的）
         // 嵌套调用时内层 gen_call 也在用同一临时区，故记录本层暂存起点 base，
         // 本层参数存在 base+4 .. base+n*4，与内层互不覆盖
