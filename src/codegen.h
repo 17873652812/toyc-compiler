@@ -825,6 +825,20 @@ private:
 
     // ---- 函数调用 ----
 
+    // 判断调用是否可内联的纯函数（供实参嵌套内联检查用）
+    bool is_inlinable_pure(const CallExpr* call) {
+        if (!opt_) return false;
+        auto it = funcs_.find(call->func_name);
+        if (it == funcs_.end()) return false;
+        const FuncDef* f = it->second;
+        if (f->name == current_func_) return false;
+        if (call->args.size() != f->params.size()) return false;
+        if (f->body->stmts.size() != 1) return false;
+        auto* ret = dynamic_cast<const ReturnStmt*>(f->body->stmts[0].get());
+        if (!ret || !ret->expr) return false;
+        return !contains_call(ret->expr.get());   // 函数体是纯算术
+    }
+
     // -opt 内联：函数体是单条 return 表达式、无递归、参数匹配 → 直接展开
     // （避免循环内频繁调用小函数的 call/ret 开销，是 p08 性能关键）
     bool inline_call(const CallExpr* call) {
@@ -837,7 +851,17 @@ private:
         if (f->body->stmts.size() != 1) return false;           // 需单条语句
         auto* ret = dynamic_cast<const ReturnStmt*>(f->body->stmts[0].get());
         if (!ret || !ret->expr) return false;                    // 需 return expr;
-        if (funcs_calls_self(f)) return false;                  // 函数体内有递归不内联
+        // 纯函数才内联：函数体表达式不能含函数调用（展开会重复求值产生副作用）。
+        // 实参含调用时，仅当该调用本身是可内联的纯函数才允许（嵌套内联）
+        if (contains_call(ret->expr.get())) return false;
+        for (auto& a : call->args) {
+            if (contains_call(a.get())) {
+                // 实参含调用：必须是可内联的纯函数调用才接受
+                if (auto* ac = dynamic_cast<const CallExpr*>(a.get()))
+                    if (is_inlinable_pure(ac)) continue;
+                return false;
+            }
+        }
         // 绑定形参→实参（保存旧映射，支持嵌套内联）
         auto saved = inline_args_;
         inline_args_.clear();
