@@ -140,9 +140,6 @@ private:
     std::string current_func_;
     std::unordered_map<std::string, std::string> copy_tab_;   // 复制传播：变量→其来源变量
     std::vector<std::unordered_map<std::string, std::string>> copy_stack_;  // 嵌套作用域
-    std::unordered_map<std::string, int> cse_map_;   // CSE：子表达式key→帧内偏移
-    std::vector<int> cse_offs_;                      // CSE 已分配偏移（语句级释放）
-    int cse_base_ = 0;                               // CSE 缓存区基址（临时区顶部向下）
     std::vector<std::string> current_params_;       // 当前函数参数名（尾递归用）
     std::vector<VarLoc> current_param_vars_;        // 当前函数参数位置
     struct LoopLabels { int begin, end; };
@@ -376,8 +373,6 @@ private:
         scope_off_base_.clear();
         copy_tab_.clear();
         copy_stack_.clear();
-        cse_map_.clear();
-        cse_offs_.clear();
         var_base_ = 0;
         loops_.clear();
 
@@ -441,8 +436,6 @@ private:
         scope_off_base_.clear();
         copy_tab_.clear();
         copy_stack_.clear();
-        cse_map_.clear();
-        cse_offs_.clear();
         reg_temp_depth_ = 0;
         loops_.clear();
 
@@ -454,10 +447,9 @@ private:
             mmt = std::max(mmt, max_mem_temp_stmt(s.get()));
             max_tail = std::max(max_tail, max_tail_args(s.get()));
         }
-        temp_limit_ = 4 * (mmt + 8) + 4 * max_tail + 4 * nstack + 16 + 64;  // +64 CSE 缓存区
+        temp_limit_ = 4 * (mmt + 8) + 4 * max_tail + 4 * nstack + 16;
         temp_base_ = 0;              // 临时区在帧底
         var_base_ = temp_limit_;     // 溢出变量在临时区之上
-        cse_base_ = temp_limit_;     // CSE 缓存区：临时区顶部向下（body 前已知，不冲突）
 
         // 分配形参（优先寄存器）
         for (auto& p : func->params) {
@@ -569,10 +561,6 @@ private:
 
     void gen_stmt(const ASTNode* stmt) {
         if (auto* b = dynamic_cast<const Block*>(stmt)) { gen_block(b); return; }
-
-        // CSE 语句级清空：CSE 只在同一基本块内有效，语句结束必须清空
-        // （避免跨语句变量变化导致复用错误值）
-        if (opt_) { cse_map_.clear(); cse_offs_.clear(); }
 
         // 复制传播失效：连续赋值/声明之间传播；遇到调用、裸表达式语句、break/continue
         // 终止传播（保守安全）。return/if/while 在各自内部求值表达式后再失效。
@@ -778,25 +766,6 @@ private:
                 std::string rr = simple_var_reg(bin->right.get());  // 右是变量→"sY"，否则空
                 if (!lr.empty() && !rr.empty()) {
                     // 左右都是寄存器变量：add t0, sX, sY（一条指令）
-                    // CSE（-opt）：同一语句内重复的纯算术子表达式复用结果
-                    if (opt_) {
-                        std::string key = lr + " " + bin->op + " " + rr;
-                        auto hit = cse_map_.find(key);
-                        if (hit != cse_map_.end()) {
-                            // 命中：从缓存区读结果
-                            out_ << "    lw t0, " << hit->second << "(sp)\n";
-                            return;
-                        }
-                        gen_bin_op2(bin->op, lr, rr);
-                        // 缓存结果到 CSE 区（临时区顶部向下），最多 16 槽防溢出
-                        if ((int)cse_offs_.size() < 16) {
-                            int off = cse_base_ - (int)(cse_offs_.size() + 1) * 4;
-                            cse_offs_.push_back(off);
-                            out_ << "    sw t0, " << off << "(sp)\n";
-                            cse_map_[key] = off;
-                        }
-                        return;
-                    }
                     gen_bin_op2(bin->op, lr, rr);
                     return;
                 }
