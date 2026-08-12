@@ -366,8 +366,19 @@ private:
                     (int)call->args.size() == cur_.param_count) {
                     std::vector<int> args;
                     for (auto& a : call->args) args.push_back(lower_expr(a.get()));
-                    for (size_t i = 0; i < args.size(); i++)
-                        emit({IROp::MOV, cur_.params[i], args[i]});
+                    // 关键：先把每个实参拷到全新临时，再绑定。
+                    // 若实参直接是形参槽（如 return f(b-1, a)），按序绑定会覆盖
+                    // 仍要被读取的形参（MOV a,b-1 后再 MOV b,a 读到的是新 a）。
+                    // 全新临时 + 复制传播失效修复 = 绑定顺序安全。
+                    std::vector<int> staged;
+                    staged.reserve(args.size());
+                    for (int a : args) {
+                        int t = new_vreg();
+                        emit({IROp::MOV, t, a});
+                        staged.push_back(t);
+                    }
+                    for (size_t i = 0; i < staged.size(); i++)
+                        emit({IROp::MOV, cur_.params[i], staged[i]});
                     emit({IROp::BR, -1, -1, -1, 0, cur_.entry_label});
                     return;
                 }
