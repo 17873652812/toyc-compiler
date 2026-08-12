@@ -723,13 +723,6 @@ private:
             if (opt_ && !contains_call(bin->right.get())) {
                 std::string lr = simple_var_reg(bin->left.get());   // 左是变量→"sX"，否则空
                 std::string rr = simple_var_reg(bin->right.get());  // 右是变量→"sY"，否则空
-                // 常量立即数优化：x op const 且 op 支持立即数 → addi/slti 一条指令
-                if (!lr.empty() && is_imm_op(bin->op)) {
-                    if (int rv = const_imm(bin->right.get(), bin->op)) {
-                        gen_imm_binop(bin->op, lr, rv);
-                        return;
-                    }
-                }
                 if (!lr.empty() && !rr.empty()) {
                     // 左右都是寄存器变量：add t0, sX, sY（一条指令）
                     gen_bin_op2(bin->op, lr, rr);
@@ -788,26 +781,6 @@ private:
             return "";
         }
         return "";
-    }
-
-    // 该运算符是否支持立即数操作数（addi/slti）
-    bool is_imm_op(const std::string& op) {
-        return op == "+" || op == "-" || op == "<";
-    }
-    // 右操作数是可折叠的小常量且适配立即数范围 → 返回值，否则 0
-    int const_imm(const ASTNode* e, const std::string& op) {
-        if (auto* num = dynamic_cast<const NumberExpr*>(e)) {
-            int v = num->value;
-            if (op == "-") v = -v;   // x - c → addi t0, sX, -c
-            if (v >= -2048 && v <= 2047) return v;   // RISC-V 12 位立即数
-        }
-        return 0;  // 不可用
-    }
-    // 立即数运算：t0 = sX op imm
-    void gen_imm_binop(const std::string& op, const std::string& l, int imm) {
-        if (op == "+" || op == "-") out_ << "    addi t0, " << l << ", " << imm << "\n";
-        else if (op == "<") out_ << "    slti t0, " << l << ", " << imm << "\n";
-        else throw std::runtime_error("imm binop: " + op);
     }
 
     // 代数化简：x+0, x-0, x*1, x*0, x*2^k, x/1, x%1
