@@ -774,6 +774,112 @@ static void fuse_cmp_branch(IrFunc& f) {
     }
 }
 
+// 跨块 CSE（全局值编号 + 支配检查）：
+// 对操作数都是"单赋值 vreg 或常量"的纯计算表达式做全局值编号，
+// 复用安全条件：表达式计算所在基本块必须支配当前使用块
+//（支配保证表达式在当前路径上一定执行过，值已计算）。
+// 涉及可变槽变量的表达式仍只在块内 CSE（cse_bb 负责）。
+static bool cse_global(IrFunc& f) {
+    auto ranges = bb_ranges(f);
+    int nb = (int)ranges.size();
+    if (nb < 2) return false;
+    std::vector<int> blk_of(f.insns.size());
+    for (int bi = 0; bi < nb; bi++)
+        for (int i = ranges[bi].first; i < ranges[bi].second; i++)
+            blk_of[i] = bi;
+    // CFG + 支配者
+    std::unordered_map<int, int> lbl2blk;
+    for (int bi = 0; bi < nb; bi++)
+        for (int i = ranges[bi].first; i < ranges[bi].second; i++)
+            if (f.insns[i].op == IROp::LABEL) lbl2blk[f.insns[i].label] = bi;
+    std::vector<std::vector<int>> pred(nb), succ(nb);
+    for (int bi = 0; bi < nb; bi++) {
+        int last = ranges[bi].second - 1;
+        IROp op = f.insns[last].op;
+        auto link = [&](int a, int b) { succ[a].push_back(b); pred[b].push_back(a); };
+        if (op == IROp::BZ || op == IROp::BNZ || op == IROp::BLT || op == IROp::BGE) {
+            auto it = lbl2blk.find(f.insns[last].label);
+            if (it != lbl2blk.end()) link(bi, it->second);
+            if (bi + 1 < nb) link(bi, bi + 1);
+        } else if (op == IROp::BR) {
+            auto it = lbl2blk.find(f.insns[last].label);
+            if (it != lbl2blk.end()) link(bi, it->second);
+        } else if (op != IROp::RET && bi + 1 < nb) {
+            link(bi, bi + 1);
+        }
+    }
+    std::vector<std::unordered_set<int>> dom(nb);
+    dom[0].insert(0);
+    for (int bi = 1; bi < nb; bi++) for (int i = 0; i < nb; i++) dom[bi].insert(i);
+    bool ch = true;
+    while (ch) {
+        ch = false;
+        for (int bi = 1; bi < nb; bi++) {
+            std::unordered_set<int> nd;
+            if (pred[bi].empty()) nd.insert(bi);
+            else {
+                nd = dom[pred[bi][0]];
+                for (size_t pi = 1; pi < pred[bi].size(); pi++) {
+                    std::unordered_set<int> inter;
+                    for (int v : nd) if (dom[pred[bi][pi]].count(v)) inter.insert(v);
+                    nd = std::move(inter);
+                }
+                nd.insert(bi);
+            }
+            if (nd != dom[bi]) { dom[bi] = std::move(nd); ch = true; }
+        }
+    }
+    // 单赋值：临时 vreg 定义 ≤1 次 → 值固定；参数必须从未被赋值（def_count==0）
+    std::unordered_set<int> params(f.params.begin(), f.params.end());
+    std::unordered_map<int, int> def_count;
+    for (const Insn& in : f.insns) if (in.d >= 0) def_count[in.d]++;
+    auto single = [&](int v) {
+        if (v < 0) return true;
+        if (params.count(v)) return def_count.count(v) && def_count[v] == 0;
+        return def_count.count(v) && def_count[v] <= 1;
+    };
+    // 全局值编号：key → (结果 vreg, 计算所在块)
+    std::unordered_map<std::string, std::pair<int, int>> tab;
+    bool changed = false;
+    for (size_t i = 0; i < f.insns.size(); i++) {
+        Insn& in = f.insns[i];
+        std::string key;
+        bool pure = true;
+        auto ok2 = [&](int a, int b) { return single(a) && single(b); };
+        switch (in.op) {
+        case IROp::CONST: key = "C," + std::to_string(in.imm); break;
+        case IROp::ADD: if (!ok2(in.a, in.b)) pure = false; else key = "A," + std::to_string(in.a) + "," + std::to_string(in.b); break;
+        case IROp::SUB: if (!ok2(in.a, in.b)) pure = false; else key = "S," + std::to_string(in.a) + "," + std::to_string(in.b); break;
+        case IROp::MUL: if (!ok2(in.a, in.b)) pure = false; else key = "M," + std::to_string(in.a) + "," + std::to_string(in.b); break;
+        case IROp::DIV: if (!ok2(in.a, in.b)) pure = false; else key = "D," + std::to_string(in.a) + "," + std::to_string(in.b); break;
+        case IROp::REM: if (!ok2(in.a, in.b)) pure = false; else key = "R," + std::to_string(in.a) + "," + std::to_string(in.b); break;
+        case IROp::SLT: if (!ok2(in.a, in.b)) pure = false; else key = "L," + std::to_string(in.a) + "," + std::to_string(in.b); break;
+        case IROp::ADDI: if (!single(in.a)) pure = false; else key = "I," + std::to_string(in.a) + "," + std::to_string(in.imm); break;
+        case IROp::SLTI: if (!single(in.a)) pure = false; else key = "i," + std::to_string(in.a) + "," + std::to_string(in.imm); break;
+        case IROp::SLLI: if (!single(in.a)) pure = false; else key = "l," + std::to_string(in.a) + "," + std::to_string(in.imm); break;
+        case IROp::NEG: if (!single(in.a)) pure = false; else key = "N," + std::to_string(in.a); break;
+        case IROp::SEQZ: if (!single(in.a)) pure = false; else key = "Z," + std::to_string(in.a); break;
+        case IROp::SNEZ: if (!single(in.a)) pure = false; else key = "z," + std::to_string(in.a); break;
+        case IROp::LA: key = "G," + in.name; break;
+        default: pure = false;
+        }
+        if (pure && in.d >= 0) {
+            auto it = tab.find(key);
+            if (it != tab.end() && it->second.first != in.d &&
+                dom[blk_of[i]].count(it->second.second)) {
+                // 计算块支配当前块 → 一定执行过 → 安全复用
+                in.op = IROp::MOV;
+                in.a = it->second.first;
+                in.b = -1;
+                changed = true;
+            } else {
+                tab[key] = {in.d, blk_of[i]};
+            }
+        }
+    }
+    return changed;
+}
+
 // LICM-常量外提：把循环内不变的 CONST/LA 指令移到函数入口。
 // CONST/LA 无副作用，提前/无条件执行语义不变；省掉循环每次迭代的 li/la。
 static void licm_const(IrFunc& f) {
@@ -1066,6 +1172,32 @@ static void strength_reduce(IrFunc& f) {
     }
 }
 
+// 跳转合并（控制流清理）：`BR L1` 且 L1 是空块（LABEL + BR L2）→ 直接 BR L2。
+// 配合 DCE 的不可达块删除，清除中间空跳转。
+static void jump_threading(IrFunc& f) {
+    std::unordered_map<int, int> lbl_pos;
+    for (int i = 0; i < (int)f.insns.size(); i++)
+        if (f.insns[i].op == IROp::LABEL) lbl_pos[f.insns[i].label] = i;
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (int i = 0; i < (int)f.insns.size(); i++) {
+            Insn& in = f.insns[i];
+            if (in.op != IROp::BR) continue;
+            auto it = lbl_pos.find(in.label);
+            if (it == lbl_pos.end()) continue;
+            int t = it->second + 1;
+            while (t < (int)f.insns.size() &&
+                   (f.insns[t].op == IROp::LABEL || f.insns[t].op == IROp::NOP)) t++;
+            if (t < (int)f.insns.size() && f.insns[t].op == IROp::BR &&
+                f.insns[t].label != in.label) {
+                in.label = f.insns[t].label;
+                changed = true;
+            }
+        }
+    }
+}
+
 // 主优化入口：多轮迭代到稳定
 static void optimize_ir(IrFunc& f) {
     for (int round = 0; round < 4; round++) {
@@ -1075,12 +1207,13 @@ static void optimize_ir(IrFunc& f) {
             changed |= const_fold_bb(f, pr.first, pr.second);
             changed |= copy_prop_bb(f, pr.first, pr.second);
             changed |= cse_bb(f, pr.first, pr.second);
+            changed |= cse_global(f);   // 跨块 CSE（全局值编号+支配）
         }
         changed |= merge_mov_into_op(f);   // 消除赋值后的 mv
         fuse_cmp_branch(f);                // SLT+BZ/BNZ → BLT/BGE（省 1 条/循环迭代）
         licm_const(f);                     // 循环内常量外提
         dce(f);
-        strength_reduce(f);                // 归纳变量强度削减（带寄存器压力检查）
+        jump_threading(f);                 // 跳转合并（DCE 强化）
         dce(f);
         if (!changed) break;
     }
@@ -1186,6 +1319,7 @@ struct RegAlloc {
         static const std::vector<int> T = {6, 7, 28, 29, 30};                              // t1-t5
         static std::vector<int> ST;   // T 优先，然后 S
         if (ST.empty()) { for (int p : T) ST.push_back(p); for (int p : S) ST.push_back(p); }
+        int cap_all = 17;
 
         Liveness L = compute_liveness(f);
         int n = (int)f.insns.size();
@@ -1236,7 +1370,7 @@ struct RegAlloc {
         select_spill(cvregs, 12);
         std::vector<int> allv;
         for (auto& kv : first_pt) allv.push_back(kv.first);
-        select_spill(allv, 17);
+        select_spill(allv, cap_all);
 
         // 分配：跨调用 → S；非跨调用 → T 然后 S。一个 vreg 整个函数一个物理寄存器。
         // 关键：两个池共用同一个 owner 数组——否则第二个池会抢第一个池已占的寄存器
