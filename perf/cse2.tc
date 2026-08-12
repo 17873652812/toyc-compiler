@@ -1,0 +1,9 @@
+int main() {
+    int sum = 0;
+    int i = 0;
+    while (i < 1000000) {
+        sum = sum + (i * 3) + (i * 3);   // 同一语句内 i*3 重复
+        i = i + 1;
+    }
+    return sum % 256;
+}

@@ -1,0 +1,10 @@
+int main() {
+    int sum = 0;
+    int i = 0;
+    int x = 3;
+    while (i < 1000000) {
+        sum = sum + (i * x) + (i * x);   // i*x 重复，两边都是变量
+        i = i + 1;
+    }
+    return sum % 256;
+}
