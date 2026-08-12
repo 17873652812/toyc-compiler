@@ -530,12 +530,14 @@ static bool const_fold_bb(IrFunc& f, int s, int e) {
             IROp op = in.op;
             int rv = 0;
             if (op == IROp::ADD) {
-                if (kb && bv == 0) { in.op = IROp::MOV; in.b = -1; done = true; }
+                if (in.a == in.b) { in.op = IROp::SLLI; in.b = -1; in.imm = 1; done = true; }   // x+x → slli
+                else if (kb && bv == 0) { in.op = IROp::MOV; in.b = -1; done = true; }
                 else if (ka && av == 0) { in.op = IROp::MOV; in.a = in.b; in.b = -1; done = true; }
                 else if (kb && fits(bv)) { in.op = IROp::ADDI; in.b = -1; in.imm = bv; done = true; }
                 else if (ka && fits(av)) { in.op = IROp::ADDI; in.a = in.b; in.b = -1; in.imm = av; done = true; }
             } else if (op == IROp::SUB) {
-                if (kb && bv == 0) { in.op = IROp::MOV; in.b = -1; done = true; }
+                if (in.a == in.b) { in.op = IROp::CONST; in.a = in.b = -1; in.imm = 0; done = true; }   // x-x → 0
+                else if (kb && bv == 0) { in.op = IROp::MOV; in.b = -1; done = true; }
                 else if (ka && av == 0) { in.op = IROp::NEG; in.a = in.b; in.b = -1; done = true; }   // 0-x → neg
                 else if (kb && fits(-(long long)bv)) { in.op = IROp::ADDI; in.b = -1; in.imm = -bv; done = true; }
             } else if (op == IROp::MUL) {
