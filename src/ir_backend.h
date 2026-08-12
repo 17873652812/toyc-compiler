@@ -1311,7 +1311,8 @@ struct RegAlloc {
     std::unordered_set<int> spilled;      // 溢出的虚拟寄存器
     std::unordered_map<int, int> slot;    // 溢出 → 栈偏移
     int frame = 0;        // 帧大小（字节）
-    int n_saved = 0;      // 需保存的 s 寄存器个数（s0..sK）
+    int n_saved = 0;      // 需保存的 s 寄存器个数
+    std::vector<int> s_saved;   // 实际用到的 s 寄存器索引（稀疏，避免保存没用的）
     int spill_bytes = 0;
 
     void run(const IrFunc& f) {
@@ -1408,12 +1409,13 @@ struct RegAlloc {
         spilled = spill;
         spill_bytes = sp;
 
-        // 保存的 s 寄存器个数（s0..sK）
-        int maxs = -1;
+        // 保存实际用到的 s 寄存器（稀疏，只保存用到的，省 prologue/epilogue）
+        s_saved.clear();
         for (auto& kv : phys)
             for (int j = 0; j < 12; j++)
-                if (kv.second == S[j] && j > maxs) maxs = j;
-        n_saved = maxs + 1;
+                if (kv.second == S[j]) s_saved.push_back(j);
+        std::sort(s_saved.begin(), s_saved.end());
+        n_saved = (int)s_saved.size();
 
         // 帧 = 溢出 + 保存的 s + ra + 栈参数区
         int nstack = std::max(0, f.param_count - 8);
@@ -1563,9 +1565,9 @@ static std::string emit_function(const IrFunc& f, const RegAlloc& ra) {
     out << ".globl " << f.name << "\n" << f.name << ":\n";
     out << "    addi sp, sp, -" << frame << "\n";
     out << "    sw ra, " << (frame - 4) << "(sp)\n";
-    // 保存用到的 s 寄存器
-    for (int j = 0; j < ra.n_saved; j++)
-        out << "    sw s" << j << ", " << (save_base + j * 4) << "(sp)\n";
+    // 保存用到的 s 寄存器（稀疏：只保存实际用到的）
+    for (int k = 0; k < ra.n_saved; k++)
+        out << "    sw s" << ra.s_saved[k] << ", " << (save_base + k * 4) << "(sp)\n";
     // 绑定形参 a0-a7
     for (int i = 0; i < f.param_count && i < 8; i++) {
         int p = f.params[i];
@@ -1583,8 +1585,8 @@ static std::string emit_function(const IrFunc& f, const RegAlloc& ra) {
     for (const Insn& in : f.insns) emit_insn(out, f, ra, in);
     // epilogue
     out << ".L" << f.name << "_exit:\n";
-    for (int j = ra.n_saved - 1; j >= 0; j--)
-        out << "    lw s" << j << ", " << (save_base + j * 4) << "(sp)\n";
+    for (int k = ra.n_saved - 1; k >= 0; k--)
+        out << "    lw s" << ra.s_saved[k] << ", " << (save_base + k * 4) << "(sp)\n";
     out << "    lw ra, " << (frame - 4) << "(sp)\n";
     out << "    addi sp, sp, " << frame << "\n";
     out << "    ret\n\n";
