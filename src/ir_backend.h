@@ -601,6 +601,152 @@ static bool cse_bb(IrFunc& f, int s, int e) {
     return changed;
 }
 
+// 是否为无副作用的"计算"指令（可直接把目标改成槽寄存器）。
+// 注意：CONST/LA 不参与合并——若合并成 `CONST 槽, 值` 会被 LICM 当循环不变量
+// 提出循环，把"循环内赋值"变成"只赋一次"。保持 CONST 定义纯临时值 + MOV 赋值，
+// 使 LICM 外提纯临时值安全。
+static bool is_pure_compute(IROp op) {
+    switch (op) {
+    case IROp::ADD: case IROp::SUB: case IROp::MUL: case IROp::DIV:
+    case IROp::REM: case IROp::SLT: case IROp::ADDI: case IROp::SLTI:
+    case IROp::SLLI: case IROp::NEG: case IROp::SEQZ: case IROp::SNEZ:
+    case IROp::LOAD:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// 直接目标寄存器合并：`<纯运算> temp; MOV slot, temp`（temp 仅此处使用）
+// → `<纯运算> slot`，省掉赋值后的 mv。slot 在运算与 MOV 之间未被使用才安全。
+static bool merge_mov_into_op(IrFunc& f) {
+    std::unordered_map<int, int> uses;
+    for (const Insn& in : f.insns) {
+        if (in.a >= 0) uses[in.a]++;
+        if (in.b >= 0) uses[in.b]++;
+        for (int v : in.args) uses[v]++;
+    }
+    bool changed = false;
+    for (size_t i = 0; i < f.insns.size(); i++) {
+        Insn& in = f.insns[i];
+        if (in.op != IROp::MOV || in.a < 0) continue;
+        int temp = in.a, slot = in.d;
+        if (uses[temp] != 1) continue;   // temp 只被这条 MOV 使用
+        for (size_t j = i; j-- > 0;) {   // 从后往前找 temp 的定义
+            if (f.insns[j].d != temp) continue;
+            Insn& def = f.insns[j];
+            if (!is_pure_compute(def.op)) break;
+            // 检查 slot 在 (j, i) 之间既未被读取也未被重定义（避免覆盖/丢值）
+            bool used = false;
+            for (size_t k = j + 1; k < i; k++) {
+                const Insn& m = f.insns[k];
+                if (m.d == slot || m.a == slot || m.b == slot ||
+                    std::find(m.args.begin(), m.args.end(), slot) != m.args.end()) {
+                    used = true; break;
+                }
+            }
+            if (used) break;
+            def.d = slot;
+            in.op = IROp::NOP;   // 删掉 MOV
+            changed = true;
+            break;
+        }
+    }
+    return changed;
+}
+
+// LICM-常量外提：把循环内不变的 CONST/LA 指令移到函数入口。
+// CONST/LA 无副作用，提前/无条件执行语义不变；省掉循环每次迭代的 li/la。
+static void licm_const(IrFunc& f) {
+    auto ranges = bb_ranges(f);
+    int nb = (int)ranges.size();
+    if (nb < 2) return;   // 单个块无循环
+    std::unordered_map<int, int> lbl2blk;
+    for (int bi = 0; bi < nb; bi++)
+        for (int i = ranges[bi].first; i < ranges[bi].second; i++)
+            if (f.insns[i].op == IROp::LABEL) lbl2blk[f.insns[i].label] = bi;
+    std::vector<std::vector<int>> pred(nb), succ(nb);
+    for (int bi = 0; bi < nb; bi++) {
+        int last = ranges[bi].second - 1;
+        IROp op = f.insns[last].op;
+        auto link = [&](int a, int b) { succ[a].push_back(b); pred[b].push_back(a); };
+        if (op == IROp::BZ || op == IROp::BNZ) {
+            auto it = lbl2blk.find(f.insns[last].label);
+            if (it != lbl2blk.end()) link(bi, it->second);
+            if (bi + 1 < nb) link(bi, bi + 1);
+        } else if (op == IROp::BR) {
+            auto it = lbl2blk.find(f.insns[last].label);
+            if (it != lbl2blk.end()) link(bi, it->second);
+        } else if (op != IROp::RET && bi + 1 < nb) {
+            link(bi, bi + 1);
+        }
+    }
+    // 支配者（迭代数据流）
+    std::vector<std::unordered_set<int>> dom(nb);
+    dom[0].insert(0);
+    for (int bi = 1; bi < nb; bi++) for (int i = 0; i < nb; i++) dom[bi].insert(i);
+    bool ch = true;
+    while (ch) {
+        ch = false;
+        for (int bi = 1; bi < nb; bi++) {
+            std::unordered_set<int> nd;
+            if (pred[bi].empty()) { nd.insert(bi); }
+            else {
+                nd = dom[pred[bi][0]];
+                for (size_t pi = 1; pi < pred[bi].size(); pi++) {
+                    std::unordered_set<int> inter;
+                    for (int v : nd) if (dom[pred[bi][pi]].count(v)) inter.insert(v);
+                    nd = std::move(inter);
+                }
+                nd.insert(bi);
+            }
+            if (nd != dom[bi]) { dom[bi] = std::move(nd); ch = true; }
+        }
+    }
+    // 回边 → 标记循环内的块
+    std::vector<char> in_loop(nb, 0);
+    for (int u = 0; u < nb; u++)
+        for (int v : succ[u]) {
+            if (!dom[u].count(v)) continue;   // v 不支配 u → 非回边
+            std::vector<char> lb(nb, 0);
+            std::vector<int> st = {u};
+            lb[u] = 1;
+            while (!st.empty()) {
+                int x = st.back(); st.pop_back();
+                for (int p : pred[x]) {
+                    if (p == v) continue;   // 不进 header
+                    if (dom[p].count(v) && !lb[p]) { lb[p] = 1; st.push_back(p); }
+                }
+            }
+            lb[v] = 1;
+            for (int bi = 0; bi < nb; bi++) if (lb[bi]) in_loop[bi] = 1;
+        }
+    // 只外提"全函数仅定义一次"的 vreg 的 CONST/LA。
+    // 关键：`&&`/`||` 的结果在不同分支被两次 CONST 定义（1 和 0），
+    // 若都提出循环会让结果永远停在入口的初值。仅单次定义的值才真正不变量。
+    std::unordered_map<int, int> def_count;
+    for (const Insn& in : f.insns)
+        if (in.d >= 0) def_count[in.d]++;
+    std::vector<Insn> hoisted;
+    for (int bi = 0; bi < nb; bi++) {
+        if (!in_loop[bi]) continue;
+        for (int i = ranges[bi].first; i < ranges[bi].second; i++) {
+            Insn& in = f.insns[i];
+            if ((in.op == IROp::CONST || in.op == IROp::LA) &&
+                in.d >= 0 && def_count[in.d] == 1) {
+                hoisted.push_back(in);
+                in.op = IROp::NOP;
+            }
+        }
+    }
+    if (hoisted.empty()) return;
+    auto it = f.insns.begin();
+    while (it != f.insns.end() && it->op != IROp::LABEL) ++it;
+    if (it == f.insns.end()) return;
+    ++it;
+    f.insns.insert(it, hoisted.begin(), hoisted.end());
+}
+
 // 死代码删除：先按可达性去掉不可达块，再删"结果未使用且无副作用"的指令
 static void dce(IrFunc& f) {
     // 1. 基本块 + 可达性
@@ -684,6 +830,8 @@ static void optimize_ir(IrFunc& f) {
             changed |= copy_prop_bb(f, pr.first, pr.second);
             changed |= cse_bb(f, pr.first, pr.second);
         }
+        changed |= merge_mov_into_op(f);   // 消除赋值后的 mv
+        licm_const(f);                     // 循环内常量外提
         dce(f);
         if (!changed) break;
     }
