@@ -1,0 +1,7 @@
+int main() {
+    int a = 5;
+    int b = a;      // 复制传播：b 的来源是 a
+    int c = b;      // c 的来源可传成 a
+    int d = c + 1;  // 用 a 的寄存器算
+    return d;       // 6
+}

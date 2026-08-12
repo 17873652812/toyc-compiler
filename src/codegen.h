@@ -88,6 +88,7 @@ private:
         if (opt_) {
             scope_reg_base_.push_back(next_reg_);
             scope_off_base_.push_back(next_offset_);
+            copy_stack_.push_back(copy_tab_);   // 保存复制表（块内隔离）
         }
     }
     void exit_scope() {
@@ -98,6 +99,8 @@ private:
             next_offset_ = scope_off_base_.back();
             scope_reg_base_.pop_back();
             scope_off_base_.pop_back();
+            copy_tab_ = copy_stack_.back();   // 恢复外层复制表
+            copy_stack_.pop_back();
         }
         symtab_.pop_back(); consts_.pop_back();
     }
@@ -135,6 +138,8 @@ private:
         return nullptr;
     }
     std::string current_func_;
+    std::unordered_map<std::string, std::string> copy_tab_;   // 复制传播：变量→其来源变量
+    std::vector<std::unordered_map<std::string, std::string>> copy_stack_;  // 嵌套作用域
     std::vector<std::string> current_params_;       // 当前函数参数名（尾递归用）
     std::vector<VarLoc> current_param_vars_;        // 当前函数参数位置
     struct LoopLabels { int begin, end; };
@@ -366,6 +371,8 @@ private:
         max_offset_used_ = 0;
         scope_reg_base_.clear();
         scope_off_base_.clear();
+        copy_tab_.clear();
+        copy_stack_.clear();
         var_base_ = 0;
         loops_.clear();
 
@@ -427,6 +434,8 @@ private:
         max_offset_used_ = 0;
         scope_reg_base_.clear();
         scope_off_base_.clear();
+        copy_tab_.clear();
+        copy_stack_.clear();
         reg_temp_depth_ = 0;
         loops_.clear();
 
@@ -553,6 +562,17 @@ private:
     void gen_stmt(const ASTNode* stmt) {
         if (auto* b = dynamic_cast<const Block*>(stmt)) { gen_block(b); return; }
 
+        // 复制传播失效：连续赋值/声明之间传播；遇到调用、裸表达式语句、break/continue
+        // 终止传播（保守安全）。return/if/while 在各自内部求值表达式后再失效。
+        if (opt_ && (dynamic_cast<const CallExpr*>(stmt)
+            || dynamic_cast<const BreakStmt*>(stmt)
+            || dynamic_cast<const ContinueStmt*>(stmt)
+            || dynamic_cast<const NumberExpr*>(stmt)
+            || dynamic_cast<const IdExpr*>(stmt)
+            || dynamic_cast<const BinaryExpr*>(stmt)
+            || dynamic_cast<const UnaryExpr*>(stmt)))
+            copy_tab_.clear();
+
         // ConstDecl：编译期求值，存入常量表（v1.0）
         if (auto* cd = dynamic_cast<const ConstDecl*>(stmt)) {
             int val = eval_const(cd->init.get());
@@ -561,6 +581,16 @@ private:
         }
 
         if (auto* vd = dynamic_cast<const VarDecl*>(stmt)) {
+            // 复制传播（-opt）：int x = y; 记录 x 的来源（压缩链到最终源）。
+            // x 是新变量，若初始化源是 y，则 x 在 y 被改前等于 y。
+            // 但 y 后续可能被赋值 → 失效所有依赖 y 的副本
+            if (opt_) {
+                if (auto* sid = dynamic_cast<const IdExpr*>(vd->init.get())) {
+                    if (find_var(sid->name) && !global_vars_.count(sid->name)) {
+                        copy_tab_[vd->name] = copy_source(sid->name);
+                    }
+                }
+            }
             gen_expr(vd->init.get());
             VarLoc loc = alloc_var(vd->name);
             if (loc.in_reg) out_ << "    mv s" << loc.reg << ", t0\n";
@@ -568,6 +598,17 @@ private:
             return;
         }
         if (auto* as = dynamic_cast<const AssignStmt*>(stmt)) {
+            // 复制传播（-opt）：x = y（y是简单变量）记录副本，读取x时直接用y
+            if (opt_) {
+                // 赋值目标 x 被修改：清除 x 自身的副本，以及所有依赖 x 的副本
+                invalidate_copy(as->name);
+                if (auto* sid = dynamic_cast<const IdExpr*>(as->expr.get())) {
+                    // x = y → 记录 x 的来源（压缩链到最终源）
+                    if (find_var(sid->name) && !global_vars_.count(sid->name)) {
+                        copy_tab_[as->name] = copy_source(sid->name);
+                    }
+                }
+            }
             VarLoc* loc = find_var(as->name);
             if (loc) {
                 gen_expr(as->expr.get());
@@ -601,9 +642,11 @@ private:
                 out_ << "    mv a0, t0\n";
             }
             out_ << "    j .L" << current_func_ << "_exit\n";
+            if (opt_) copy_tab_.clear();   // return 后语句不可达，复制失效
             return;
         }
         if (auto* call = dynamic_cast<const CallExpr*>(stmt)) {
+            if (opt_) copy_tab_.clear();   // 函数调用可能改全局，失效
             gen_call(call);
             return;
         }
@@ -673,6 +716,16 @@ private:
         if (auto* num = dynamic_cast<const NumberExpr*>(expr)) {
             out_ << "    li t0, " << num->value << "\n";
             return;
+        }
+        // 复制传播（-opt）：若 x 的值来自 y，直接读 y 的位置
+        // 放在最前，确保所有变量读取（含寄存器寻址优化的路径）都生效。
+        // 单级展开（copy_tab_ 已存最终源），避免链式递归/死循环
+        if (opt_ && dynamic_cast<const IdExpr*>(expr)) {
+            auto cp = copy_tab_.find(static_cast<const IdExpr*>(expr)->name);
+            if (cp != copy_tab_.end()) {
+                gen_expr(make_id(cp->second).get());
+                return;
+            }
         }
         // 常量折叠：整棵子树可编译期求值 → 直接 li（-opt）
         if (opt_) {
@@ -760,11 +813,44 @@ private:
     }
 
     // 代数化简：x+0, x-0, x*1, x*0, x*2^k, x/1, x%1
-    // 若表达式是 s 寄存器中的变量（非 const、非全局），返回其寄存器名；否则空串
+    // 构造一个临时 IdExpr（复制传播替换用）
+    std::unique_ptr<ASTNode> make_id(const std::string& name) {
+        return std::make_unique<IdExpr>(name);
+    }
+
+    // 变量 x 被赋值/声明后：清除 x 自身的副本，以及所有"源为 x"的副本
+    // （那些副本的值已过时，读取会得到错误值）
+    void invalidate_copy(const std::string& x) {
+        copy_tab_.erase(x);
+        for (auto it = copy_tab_.begin(); it != copy_tab_.end(); ) {
+            if (it->second == x) it = copy_tab_.erase(it);
+            else ++it;
+        }
+    }
+
+    // 沿复制表追踪变量到最终源（防循环）
+    std::string copy_source(const std::string& name) {
+        std::string cur = name;
+        std::unordered_set<std::string> seen;
+        while (seen.insert(cur).second) {
+            auto it = copy_tab_.find(cur);
+            if (it == copy_tab_.end()) break;
+            cur = it->second;
+        }
+        return cur;
+    }
+
+    // 若表达式是 s 寄存器中的变量（非 const、非全局），返回其寄存器名；否则空串。
+    // 复制传播：若变量有副本（x→y），返回 y 的寄存器
     std::string simple_var_reg(const ASTNode* e) {
         if (auto* id = dynamic_cast<const IdExpr*>(e)) {
             if (find_const(id->name)) return "";   // const 是立即数，不算
-            if (VarLoc* loc = find_var(id->name)) {
+            std::string name = id->name;
+            if (opt_) {
+                auto cp = copy_tab_.find(name);
+                if (cp != copy_tab_.end()) name = cp->second;   // 用副本源
+            }
+            if (VarLoc* loc = find_var(name)) {
                 if (loc->in_reg) return "s" + std::to_string(loc->reg);
             }
             return "";
@@ -814,6 +900,7 @@ private:
     // ---- 函数调用 ----
 
     void gen_call(const CallExpr* call) {
+        if (opt_) copy_tab_.clear();   // 调用可能改全局，复制传播失效
         int n = (int)call->args.size();
         // 先求值所有参数存到临时区（避免求值后面的参数破坏前面已求值的）
         // 嵌套调用时内层 gen_call 也在用同一临时区，故记录本层暂存起点 base，
