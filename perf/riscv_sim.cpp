@@ -140,6 +140,7 @@ int main(int argc, char** argv) {
         else if (i.op == "slt") R[regno(i.a)] = r(regno(i.b)) < r(regno(i.c)) ? 1 : 0;
         else if (i.op == "sltu") R[regno(i.a)] = (uint32_t)r(regno(i.b)) < (uint32_t)r(regno(i.c)) ? 1 : 0;
         else if (i.op == "sltiu") R[regno(i.a)] = (uint32_t)r(regno(i.b)) < (uint32_t)i.imm ? 1 : 0;
+        else if (i.op == "slti") R[regno(i.a)] = r(regno(i.b)) < i.imm ? 1 : 0;
         else if (i.op == "slli") R[regno(i.a)] = r(regno(i.b)) << i.imm;
         else if (i.op == "xori") R[regno(i.a)] = r(regno(i.b)) ^ i.imm;
         else if (i.op == "seqz") R[regno(i.a)] = r(regno(i.b)) == 0 ? 1 : 0;   // sltiu rd,rs,1

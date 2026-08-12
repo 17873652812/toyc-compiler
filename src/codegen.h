@@ -71,6 +71,9 @@ private:
     bool opt_;
     std::unordered_map<std::string, const FuncDef*> funcs_;  // 函数名→定义（-opt 内联用）
     std::unordered_map<std::string, const ASTNode*> inline_args_;  // 内联形参名→实参 AST
+    std::unordered_map<int, std::string> const_regs_;   // 循环外提常量值→s寄存器
+    std::vector<int> loop_const_new_;                   // 本循环新外提的常量值
+    int const_saved_reg_ = -1;                          // 本循环前 next_reg_ 水位
     std::ostringstream out_;
     // 栈式作用域：每个 Block 进入时 push 一个作用域，离开时 pop
     std::vector<std::unordered_map<std::string, VarLoc>> symtab_{1};
@@ -434,6 +437,9 @@ private:
         loops_.clear();
         scope_reg_base_.clear();
         scope_off_base_.clear();
+        const_regs_.clear();
+        loop_const_new_.clear();
+        const_saved_reg_ = -1;
 
         // 预分析：临时区大小
         int np = (int)func->params.size();
@@ -640,6 +646,21 @@ private:
             }
             int bg = new_label(), en = new_label();
             loops_.push_back({bg, en});
+            // 循环不变量外提（-opt）：条件里的大常量提前加载到 s 寄存器（省每次迭代 li）
+            if (opt_) {
+                const_saved_reg_ = next_reg_;
+                loop_const_new_.clear();
+                collect_loop_consts(ws->cond.get());
+                for (int v : loop_const_new_) {
+                    if (next_reg_ < 12) {
+                        std::string rn = "s" + std::to_string(next_reg_);
+                        out_ << "    li " << rn << ", " << v << "\n";
+                        const_regs_[v] = rn;
+                        next_reg_++;
+                        if (next_reg_ > max_reg_used_) max_reg_used_ = next_reg_;
+                    }
+                }
+            }
             out_ << ".L" << bg << ":\n";
             gen_expr(ws->cond.get());
             out_ << "    beqz t0, .L" << en << "\n";
@@ -647,6 +668,11 @@ private:
             out_ << "    j .L" << bg << "\n";
             out_ << ".L" << en << ":\n";
             loops_.pop_back();
+            if (opt_) {
+                // 退出循环：恢复常量寄存器水位（释放外提常量）
+                for (int v : loop_const_new_) const_regs_.erase(v);
+                next_reg_ = const_saved_reg_;
+            }
             return;
         }
         // 裸表达式语句：x;  5;  (a+b); — 求值后丢弃结果
@@ -676,6 +702,14 @@ private:
 
     void gen_expr(const ASTNode* expr) {
         if (auto* num = dynamic_cast<const NumberExpr*>(expr)) {
+            // 循环外提常量：大常量已在循环前加载到 s 寄存器，直接读（省 li）
+            if (opt_ && (num->value < -2048 || num->value > 2047)) {
+                auto cr = const_regs_.find(num->value);
+                if (cr != const_regs_.end()) {
+                    out_ << "    mv t0, " << cr->second << "\n";
+                    return;
+                }
+            }
             out_ << "    li t0, " << num->value << "\n";
             return;
         }
@@ -718,11 +752,18 @@ private:
             // 代数化简（-opt）
             if (opt_ && simplify_binary(bin)) return;
 
-            // 寄存器操作数优化（-opt）：左右操作数若是 s 寄存器变量，直接用作操作数，
-            // 省掉 mv 搬运。只在右子树无调用（t 寄存器安全）且非短路时用。
+            // 寄存器/立即数操作数优化（-opt）：操作数是 s 寄存器变量或小常量时，
+            // 直接用作操作数，省掉 mv/li 搬运。只在右子树无调用且非短路时用。
             if (opt_ && !contains_call(bin->right.get())) {
                 std::string lr = simple_var_reg(bin->left.get());   // 左是变量→"sX"，否则空
                 std::string rr = simple_var_reg(bin->right.get());  // 右是变量→"sY"，否则空
+                // 常量立即数优化：x op const 且 op 支持立即数 → addi/slti 一条指令
+                if (!lr.empty() && is_imm_op(bin->op)) {
+                    if (int rv = const_imm(bin->right.get(), bin->op)) {
+                        gen_imm_binop(bin->op, lr, rv);
+                        return;
+                    }
+                }
                 if (!lr.empty() && !rr.empty()) {
                     // 左右都是寄存器变量：add t0, sX, sY（一条指令）
                     gen_bin_op2(bin->op, lr, rr);
@@ -781,6 +822,47 @@ private:
             return "";
         }
         return "";
+    }
+
+    // 收集表达式里超出立即数范围的大常量（循环外提用）
+    void collect_loop_consts(const ASTNode* e) {
+        if (auto* num = dynamic_cast<const NumberExpr*>(e)) {
+            if ((num->value < -2048 || num->value > 2047) && const_regs_.count(num->value) == 0)
+                loop_const_new_.push_back(num->value);
+            return;
+        }
+        if (auto* b = dynamic_cast<const BinaryExpr*>(e)) {
+            collect_loop_consts(b->left.get());
+            collect_loop_consts(b->right.get());
+            return;
+        }
+        if (auto* u = dynamic_cast<const UnaryExpr*>(e)) {
+            collect_loop_consts(u->expr.get());
+            return;
+        }
+        if (auto* c = dynamic_cast<const CallExpr*>(e)) {
+            for (auto& a : c->args) collect_loop_consts(a.get());
+        }
+    }
+
+    // 该运算符是否支持立即数操作数（addi/slti）
+    bool is_imm_op(const std::string& op) {
+        return op == "+" || op == "-" || op == "<";
+    }
+    // 右操作数是可折叠的小常量且适配立即数范围 → 返回值，否则 0
+    int const_imm(const ASTNode* e, const std::string& op) {
+        if (auto* num = dynamic_cast<const NumberExpr*>(e)) {
+            int v = num->value;
+            if (op == "-") v = -v;   // x - c → addi t0, sX, -c
+            if (v >= -2048 && v <= 2047) return v;   // RISC-V 12 位立即数
+        }
+        return 0;  // 不可用
+    }
+    // 立即数运算：t0 = sX op imm
+    void gen_imm_binop(const std::string& op, const std::string& l, int imm) {
+        if (op == "+" || op == "-") out_ << "    addi t0, " << l << ", " << imm << "\n";
+        else if (op == "<") out_ << "    slti t0, " << l << ", " << imm << "\n";
+        else throw std::runtime_error("imm binop: " + op);
     }
 
     // 代数化简：x+0, x-0, x*1, x*0, x*2^k, x/1, x%1
