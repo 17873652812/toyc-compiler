@@ -42,18 +42,38 @@ static bool closed_form_loops(IrFunc& f) {
         if (hterm != IROp::BGE && hterm != IROp::BLT &&
             hterm != IROp::BZ && hterm != IROp::BNZ) continue;
         int header_label = f.insns[hs].label;
-        int exitlbl = f.insns[he - 1].label;
+        int brtgt = f.insns[he - 1].label;
 
-        // 出口块必须在体块之后
-        int exitblk = -1;
+        // 两种布局：
+        //   正常：头块条件分支→出口；体块 hb+1 以 BR 回头块；出口 hb+2 以标签开头
+        //   反转：头块条件分支→体块；出口 hb+1 为 fall-through（返回代码）；体块 hb+2
+        // 先找"以 BR 回头块标签结尾"的块 → 那就是体块
+        int bodyblk = -1;
+        for (int bi = hb + 1; bi <= hb + 2 && bi < nb; bi++) {
+            int ei = ranges[bi].second - 1;
+            if (f.insns[ei].op == IROp::BR && f.insns[ei].label == header_label) { bodyblk = bi; break; }
+        }
+        if (bodyblk < 0) continue;
+        bool inverted = (bodyblk == hb + 2);
+        int exitblk = inverted ? (hb + 1) : (hb + 2);
+
+        // 分支目标必须指向：正常→出口块首标签；反转→体块首标签
+        int tgtblk = -1;
         for (int bi = 0; bi < nb; bi++)
             for (int i = ranges[bi].first; i < ranges[bi].second; i++)
-                if (f.insns[i].op == IROp::LABEL && f.insns[i].label == exitlbl) exitblk = bi;
-        if (exitblk != hb + 2) continue;   // 体块必须恰好一块，出口紧跟
+                if (f.insns[i].op == IROp::LABEL && f.insns[i].label == brtgt) tgtblk = bi;
+        if (tgtblk < 0) continue;
+        if (inverted) { if (tgtblk != bodyblk) continue; }
+        else           { if (tgtblk != exitblk) continue; }
 
-        int bs = ranges[hb + 1].first, be = ranges[hb + 1].second;
-        if (f.insns[be - 1].op != IROp::BR) continue;
-        if (f.insns[be - 1].label != header_label) continue;   // 回边跳回头块标签
+        int bs = ranges[bodyblk].first, be = ranges[bodyblk].second;
+        int es = ranges[exitblk].first, ee = ranges[exitblk].second;
+
+        // 出口块（反转布局里是返回代码）必须简单：无 CALL/STORE/LOAD/LA，且以 BR/RET 结束
+        if (inverted) {
+            IROp eterm = f.insns[ee - 1].op;
+            if (eterm != IROp::BR && eterm != IROp::RET) continue;
+        }
 
         // header 标签只能被回边引用一次（无 continue/外层跳入）
         int refs = 0;
@@ -63,6 +83,16 @@ static bool closed_form_loops(IrFunc& f) {
             if (isbr && in.label == header_label) refs++;
         }
         if (refs != 1) continue;
+        // 反转布局：分支目标（体块标签）只能被头块这一条分支引用
+        if (inverted) {
+            int brefs = 0;
+            for (const Insn& in : f.insns) {
+                bool isbr = in.op == IROp::BR || in.op == IROp::BZ || in.op == IROp::BNZ ||
+                            in.op == IROp::BLT || in.op == IROp::BGE;
+                if (isbr && in.label == brtgt) brefs++;
+            }
+            if (brefs != 1) continue;
+        }
 
         // 头块剩余指令 & 体块必须是纯计算（无 CALL/STORE/LOAD/LA/分支/LABEL）
         bool pure = true;
@@ -80,7 +110,9 @@ static bool closed_form_loops(IrFunc& f) {
         for (int i = bs; i < be - 1; i++) if (!ispure(f.insns[i].op)) { pure = false; break; }
         if (!pure) continue;
 
-        // 找归纳变量 iv 与步长 s：体块内唯一的 `iv = iv ± const` 定义
+        // 找归纳变量 iv 与步长 s。
+        // 形态 1：`iv = iv ± const`
+        // 形态 2（尾递归/临时链）：`temp = iv ± const; mv iv, temp` 或 `mv iv, temp; temp = iv ± const` 已折叠
         int iv = -1; long long step = 0;
         for (int i = bs; i < be - 1; i++) {
             const Insn& in = f.insns[i];
@@ -92,7 +124,20 @@ static bool closed_form_loops(IrFunc& f) {
             } else if (in.op == IROp::ADD && in.a == in.d) {
                 long long c;
                 if (eval_const_before(f, in.b, i, c)) { iv = in.d; step = c; }
+            } else if (in.op == IROp::MOV && in.a != in.d) {
+                // iv = temp；temp 由 `temp = iv ± const` 定义（循环体内）
+                for (int j = bs; j < i; j++) {
+                    const Insn& jin = f.insns[j];
+                    if (jin.d != in.a) continue;
+                    if (jin.op == IROp::ADDI && jin.a == in.d) { iv = in.d; step = jin.imm; }
+                    else if (jin.op == IROp::ADD && jin.a == in.d) {
+                        long long c;
+                        if (eval_const_before(f, jin.b, j, c)) { iv = in.d; step = c; }
+                    }
+                    break;
+                }
             }
+            if (iv >= 0) break;
         }
         if (iv < 0 || step == 0) continue;
         int ivcnt = 0;
@@ -113,35 +158,80 @@ static bool closed_form_loops(IrFunc& f) {
             if (hterm == IROp::BGE) cmp = (hc.a == iv) ? 0 : 2;      // BGE iv,N → while iv<N; BGE N,iv → while iv>N
             else cmp = (hc.a == iv) ? 3 : 1;                          // BLT iv,N → while iv>=N; BLT N,iv → while iv<=N
         } else {
-            // BZ/BNZ：在头块里找定义分支操作数的 SLT/SLTI
+            // BZ/BNZ：在头块里找定义分支操作数的比较指令。
+            // 可能形态：SLT/SLTI 直接喂；或 SLT + SEQZ（等价 <= / >=）。
             int condv = hc.a;
             int defi = -1;
             for (int i = he - 2; i >= hs; i--)
-                if (f.insns[i].d == condv && (f.insns[i].op == IROp::SLT || f.insns[i].op == IROp::SLTI)) { defi = i; break; }
+                if (f.insns[i].d == condv && (f.insns[i].op == IROp::SLT || f.insns[i].op == IROp::SLTI ||
+                                              f.insns[i].op == IROp::SEQZ)) { defi = i; break; }
             if (defi < 0) continue;
-            const Insn& sl = f.insns[defi];
-            if (sl.op == IROp::SLT) {
-                int x = sl.a, y = sl.b;
-                if (x == iv) {
-                    if (!eval_const_before(f, y, defi, N)) {
-                        if (auto it = gconsts.find(y); it != gconsts.end()) N = it->second; else continue;
-                    }
-                    // SLT iv,N → cond=(iv<N)。BZ exit when cond==0 → loop while iv<N
+            const Insn& d0 = f.insns[defi];
+            // 若最靠近分支的是 SEQZ，则往前找它操作数的 SLT/SLTI（即 <= / >= 形态）
+            if (d0.op == IROp::SEQZ) {
+                int slt_i = -1;
+                for (int i = defi - 1; i >= hs; i--)
+                    if (f.insns[i].d == d0.a && (f.insns[i].op == IROp::SLT || f.insns[i].op == IROp::SLTI)) { slt_i = i; break; }
+                if (slt_i < 0) continue;
+                const Insn& sl = f.insns[slt_i];
+                int cmp_base = -1; long long Nb = 0;
+                // 先算 SLT 的原始比较语义：SLT x,y → (x<y)
+                if (sl.op == IROp::SLTI) {
+                    if (sl.a != iv) continue;
+                    Nb = sl.imm; cmp_base = 0;   // iv < imm
+                } else {
+                    if (sl.a == iv) {
+                        if (!eval_const_before(f, sl.b, slt_i, Nb)) {
+                            if (auto it = gconsts.find(sl.b); it != gconsts.end()) Nb = it->second; else continue;
+                        }
+                        cmp_base = 0;   // iv < N
+                    } else if (sl.b == iv) {
+                        if (!eval_const_before(f, sl.a, slt_i, Nb)) {
+                            if (auto it = gconsts.find(sl.a); it != gconsts.end()) Nb = it->second; else continue;
+                        }
+                        cmp_base = 2;   // N < iv  (iv > N)
+                    } else continue;
+                }
+                // seqz 把 (iv OP N) 取反 → 循环条件是 iv !OP N
+                // seqz d, t 当 t==0 时 d=1；分支 BZ d: exit when d==0 → t!=0 → 原比较为真时循环
+                // 原比较 cmp_base: 0=iv<N, 2=iv>N
+                // seqz 取反：循环条件变为 (原比较) 的否
+                // BZ d,exit: exit when !(原比较为真)... 需推导：
+                //   t = (iv<N)。d = !t。BZ d → exit when d==0 → t==1 → iv<N 时退出
+                //   循环 while !(iv<N) = iv>=N → cmp 3
+                //   （BNZ d → exit when d!=0 → t==0 → iv<N 假 → 循环 while iv<N → cmp 0）
+                // 同理 t=(iv>N)：d=!t。BZ → exit when t → iv>N 退出 → 循环 iv<=N → cmp 1
+                //   BNZ → exit when !t → 循环 while iv>N → cmp 2
+                int flipped;
+                if (cmp_base == 0) flipped = (hterm == IROp::BZ) ? 3 : 0;   // iv<N → iv>=N / iv<N
+                else flipped = (hterm == IROp::BZ) ? 1 : 2;                  // iv>N → iv<=N / iv>N
+                cmp = flipped; N = Nb;
+            } else {
+                const Insn& sl = d0;
+                if (sl.op == IROp::SLT) {
+                    int x = sl.a, y = sl.b;
+                    if (x == iv) {
+                        if (!eval_const_before(f, y, defi, N)) {
+                            if (auto it = gconsts.find(y); it != gconsts.end()) N = it->second; else continue;
+                        }
+                        cmp = (hterm == IROp::BZ) ? 0 : 3;
+                    } else if (y == iv) {
+                        if (!eval_const_before(f, x, defi, N)) {
+                            if (auto it = gconsts.find(x); it != gconsts.end()) N = it->second; else continue;
+                        }
+                        cmp = (hterm == IROp::BZ) ? 2 : 1;
+                    } else continue;
+                } else { // SLTI d, x, imm
+                    if (sl.a != iv) continue;
+                    N = sl.imm;
                     cmp = (hterm == IROp::BZ) ? 0 : 3;
-                } else if (y == iv) {
-                    if (!eval_const_before(f, x, defi, N)) {
-                        if (auto it = gconsts.find(x); it != gconsts.end()) N = it->second; else continue;
-                    }
-                    // SLT N,iv → cond=(N<iv)。BZ exit → loop while N<iv → iv>N
-                    cmp = (hterm == IROp::BZ) ? 2 : 1;
-                } else continue;
-            } else { // SLTI d, x, imm → cond=(x<imm)，x 必须是 iv
-                if (sl.a != iv) continue;
-                N = sl.imm;
-                cmp = (hterm == IROp::BZ) ? 0 : 3;
+                }
             }
         }
         if (cmp < 0) continue;
+        // 反转布局：条件分支跳进循环体（continue），fall-through 是出口。
+        // 语义正好相反：正常布局里"分支=出口"，反转里"分支=继续循环"。
+        if (inverted) cmp = 3 - cmp;   // iv<N↔iv>=N, iv<=N↔iv>N
 
         // iv 初值 i0
         long long i0 = 0;
@@ -165,14 +255,19 @@ static bool closed_form_loops(IrFunc& f) {
             }
         }
 
-        // 收集循环后仍存活的 vreg（体块之后被引用）
+        // 收集循环后仍存活的 vreg。
+        // 正常布局：体块之后（be 起）。反转布局：出口块在体块之前的位置也要算（它运行在循环之后）。
         std::unordered_set<int> live_after;
-        for (int i = be; i < (int)f.insns.size(); i++) {
-            const Insn& in = f.insns[i];
-            if (in.a >= 0) live_after.insert(in.a);
-            if (in.b >= 0) live_after.insert(in.b);
-            for (int v : in.args) live_after.insert(v);
-        }
+        auto collect_uses = [&](int from, int to) {
+            for (int i = from; i < to; i++) {
+                const Insn& in = f.insns[i];
+                if (in.a >= 0) live_after.insert(in.a);
+                if (in.b >= 0) live_after.insert(in.b);
+                for (int v : in.args) live_after.insert(v);
+            }
+        };
+        if (inverted) collect_uses(es, ee);   // 出口块（返回代码）运行在循环后
+        collect_uses(be, (int)f.insns.size());
 
         // 候选累加器：body 内定义、循环后存活、且 ≠ iv 的 vreg
         std::vector<int> cands;
@@ -297,7 +392,12 @@ static bool closed_form_loops(IrFunc& f) {
             repl.push_back({IROp::CONST, t, -1, -1, v});
             repl.push_back({IROp::ADD, iv, iv, t});
         }
-        repl.push_back({IROp::BR, -1, -1, -1, 0, exitlbl});
+        if (inverted) {
+            // 反转布局：出口块（返回代码）运行在循环之后，原样保留其指令
+            for (int i = es; i < ee; i++) repl.push_back(f.insns[i]);
+        } else {
+            repl.push_back({IROp::BR, -1, -1, -1, 0, brtgt});   // 正常布局：跳到出口
+        }
         f.insns.erase(f.insns.begin() + hs, f.insns.begin() + be);
         f.insns.insert(f.insns.begin() + hs, repl.begin(), repl.end());
         changed = true;
