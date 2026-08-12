@@ -1,8 +1,0 @@
-int helper(int x) { return x * 3; }
-int main() {
-    int keep1 = 7;
-    int keep2 = 11;
-    int r1 = helper(keep1);      // 调用时 keep1/keep2 存活
-    int r2 = helper(keep2);
-    return keep1 + keep2 + r1 + r2;
-}

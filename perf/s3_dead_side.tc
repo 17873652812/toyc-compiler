@@ -1,7 +1,0 @@
-int cnt = 0;
-int inc(int x) { cnt = cnt + 1; return x; }
-int main() {
-    int a = inc(1);
-    return a;
-    int b = inc(2);                   // 死代码：inc 不调用
-}

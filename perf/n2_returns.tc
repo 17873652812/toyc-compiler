@@ -1,9 +1,0 @@
-int classify(int n) {
-    if (n < 0) return 1;
-    if (n == 0) return 2;
-    if (n < 10) return 3;
-    return 4;
-}
-int main() {
-    return classify(-5) * 1000 + classify(0) * 100 + classify(5) * 10 + classify(50);
-}

@@ -1,7 +1,0 @@
-int cnt = 0;
-int inc(int x) { cnt = cnt + 1; return x; }
-int main() {
-    int z = inc(5) * 0;               // inc 必须被调用
-    int w = inc(7) % 1;               // inc 必须被调用
-    return cnt;                        // 应为 2
-}

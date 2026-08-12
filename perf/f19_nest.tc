@@ -1,7 +1,0 @@
-int add2(int a, int b) { return a + b; }
-int many(int a1,int a2,int a3,int a4,int a5,int a6,int a7,int a8,int a9,int a10,int a11,int a12) {
-    return a1+a2+a3+a4+a5+a6+a7+a8+a9+a10+a11+a12;
-}
-int main() {
-    return many(add2(1,2), add2(3,4), add2(5,6), add2(7,8), add2(9,10), add2(11,12), 7, 8, 9, 10, 11, 12);
-}

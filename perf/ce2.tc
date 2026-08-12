@@ -1,7 +1,0 @@
-int main() {
-    int x = 5;
-    int y = 0;
-    if (1) { int z = 100; y = x + z; }
-    else { int w = 200; y = x + w; }
-    return y;   // 105
-}

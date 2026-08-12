@@ -1,9 +1,0 @@
-int calls = 0;
-int bump(int x) { calls = calls + 1; return x; }
-int main() {
-    int r1 = 0;
-    if (0 && bump(1)) r1 = 100;       // 短路：bump 不调用
-    int r2 = 0;
-    if (1 || bump(2)) r2 = 50;        // 短路：bump 不调用
-    return r1 + r2 + calls;           // calls 应为 0
-}

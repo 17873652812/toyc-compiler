@@ -1,5 +1,12 @@
+# 构建产物
 compiler.exe
 build/
-perf/riscv_sim.exe
-perf/.reg
+*.exe
+
+# 本地开发/教学文件（不在提交清单内，不影响编译器构建）
+docs/
+perf/
+test/
+AGENTS.md
+CLAUDE.md
 .claude/

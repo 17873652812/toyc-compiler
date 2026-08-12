@@ -1,7 +1,0 @@
-int g = 5;
-int h = 10;
-int main() {
-    g = g + 1;
-    h = h * 2;
-    return g + h;
-}
