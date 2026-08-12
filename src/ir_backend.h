@@ -456,9 +456,12 @@ static std::vector<std::pair<int, int>> bb_ranges(const IrFunc& f) {
 }
 
 // 常量折叠+传播 + 代数化简 + 立即数融合（基本块内，前向）
-static bool const_fold_bb(IrFunc& f, int s, int e) {
+// seed：全函数已知常量（跨块），块内未重定义的 vreg 沿用其常量值
+static bool const_fold_bb(IrFunc& f, int s, int e,
+                          const std::unordered_map<int, int>& seed = {}) {
     bool changed = false;
     std::unordered_map<int, int> val;   // 虚拟寄存器 → 已知常量
+    val = seed;   // 跨块常量种子：块内未重定义前有效
 
     // 常量二元运算求值（除零/模零返回失败）
     auto fold2 = [](IROp op, long long l, long long r, int& out) {
@@ -696,6 +699,47 @@ static bool cse_bb(IrFunc& f, int s, int e) {
     return changed;
 }
 
+// 全局常量传播：找出整个函数内值恒为常数的虚拟寄存器（单次定义且定义为常量/
+// MOV常量/常量运算），供各基本块常量折叠作为种子。跨块的 `int a=1; int b=a;...`
+// 链条靠它才在循环内折叠成常量。
+static std::unordered_map<int, int> compute_global_consts(const IrFunc& f) {
+    std::unordered_map<int, int> def_count;
+    for (const Insn& in : f.insns)
+        if (in.d >= 0) def_count[in.d]++;
+    std::unordered_map<int, int> gval;
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (const Insn& in : f.insns) {
+            if (in.d < 0) continue;
+            if (def_count[in.d] != 1) continue;   // 只认单次定义
+            if (gval.count(in.d)) continue;
+            auto get = [&](int v) -> int* {
+                auto it = gval.find(v);
+                return it == gval.end() ? nullptr : &it->second;
+            };
+            int r = 0; bool ok = false;
+            switch (in.op) {
+            case IROp::CONST: r = in.imm; ok = true; break;
+            case IROp::MOV:  if (int* p = get(in.a)) { r = *p; ok = true; } break;
+            case IROp::ADDI: if (int* p = get(in.a)) { r = *p + in.imm; ok = true; } break;
+            case IROp::SLTI: if (int* p = get(in.a)) { r = (*p < in.imm) ? 1 : 0; ok = true; } break;
+            case IROp::SLLI: if (int* p = get(in.a)) { r = *p << in.imm; ok = true; } break;
+            case IROp::NEG:  if (int* p = get(in.a)) { r = -*p; ok = true; } break;
+            case IROp::SEQZ: if (int* p = get(in.a)) { r = (*p == 0) ? 1 : 0; ok = true; } break;
+            case IROp::SNEZ: if (int* p = get(in.a)) { r = (*p != 0) ? 1 : 0; ok = true; } break;
+            case IROp::ADD:  if (int* p = get(in.a)) if (int* q = get(in.b)) { r = *p + *q; ok = true; } break;
+            case IROp::SUB:  if (int* p = get(in.a)) if (int* q = get(in.b)) { r = *p - *q; ok = true; } break;
+            case IROp::MUL:  if (int* p = get(in.a)) if (int* q = get(in.b)) { r = *p * *q; ok = true; } break;
+            case IROp::SLT:  if (int* p = get(in.a)) if (int* q = get(in.b)) { r = (*p < *q) ? 1 : 0; ok = true; } break;
+            default: break;
+            }
+            if (ok) { gval[in.d] = r; changed = true; }
+        }
+    }
+    return gval;
+}
+
 // 是否为无副作用的"计算"指令（可直接把目标改成槽寄存器）。
 // 注意：CONST/LA 不参与合并——若合并成 `CONST 槽, 值` 会被 LICM 当循环不变量
 // 提出循环，把"循环内赋值"变成"只赋一次"。保持 CONST 定义纯临时值 + MOV 赋值，
@@ -866,6 +910,8 @@ static void licm_const(IrFunc& f) {
     f.insns.insert(it, hoisted.begin(), hoisted.end());
 }
 
+#include "closed_form.h"
+
 // 死代码删除：先按可达性去掉不可达块，再删"结果未使用且无副作用"的指令
 static void dce(IrFunc& f) {
     // 1. 基本块 + 可达性
@@ -942,17 +988,19 @@ static void dce(IrFunc& f) {
 
 // 主优化入口：多轮迭代到稳定
 static void optimize_ir(IrFunc& f) {
-    for (int round = 0; round < 4; round++) {
+    for (int round = 0; round < 6; round++) {
         bool changed = false;
+        auto gconsts = compute_global_consts(f);   // 跨块常量种子
         auto ranges = bb_ranges(f);
         for (auto& pr : ranges) {
-            changed |= const_fold_bb(f, pr.first, pr.second);
+            changed |= const_fold_bb(f, pr.first, pr.second, gconsts);
             changed |= copy_prop_bb(f, pr.first, pr.second);
             changed |= cse_bb(f, pr.first, pr.second);
         }
         changed |= merge_mov_into_op(f);   // 消除赋值后的 mv
         fuse_cmp_branch(f);                // SLT+BZ/BNZ → BLT/BGE（省 1 条/循环迭代）
         licm_const(f);                     // 循环内常量外提
+        changed |= closed_form_loops(f);   // 闭合式循环：sum += const/线性 → 一步算出
         dce(f);
         if (!changed) break;
     }

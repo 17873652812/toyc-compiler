@@ -120,8 +120,8 @@ int main(int argc, char** argv) {
     // main 入口（无 _start，设 ra 为哨兵：main 的 ret 会触到非法地址 → 视为程序结束）
     R[1] = 0xFFFFFFFFu;
     pc = labels["main"];
-    uint32_t steps = 0;
-    const uint32_t MAXSTEPS = 200000000;
+    uint64_t steps = 0;
+    const uint64_t MAXSTEPS = 2000000000;
     while (steps++ < MAXSTEPS) {
         if (pc >= code.size()) { fprintf(stderr, "PC out of range\n"); return 3; }
         Insn& i = code[pc];
@@ -174,7 +174,10 @@ int main(int argc, char** argv) {
         else if (i.op == "call") { R[1] = pc + 1; pc = findlbl(i.a); continue; }
         else if (i.op == "ret") {
             if (R[1] >= code.size()) {  // 返回地址非法 → main 返回
-                return (int)(R[10] & 0xFF);
+                // 打印 main 的原始返回值（有符号 int），便于和 gcc 原生精确对照
+                if (getenv("SIM_STEPS")) fprintf(stderr, "STEPS=%llu\n", (unsigned long long)steps);
+                printf("%d\n", (int)R[10]);
+                return 0;
             }
             pc = R[1]; continue;
         }
