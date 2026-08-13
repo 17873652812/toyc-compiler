@@ -306,26 +306,53 @@ private:
 
     // ---- 函数调用 ----
 
+    // 表达式里是否含函数调用（判断参数是否需要暂存）
+    bool contains_call(const ASTNode* n) {
+        if (dynamic_cast<const CallExpr*>(n)) return true;
+        if (auto* b = dynamic_cast<const BinaryExpr*>(n))
+            return contains_call(b->left.get()) || contains_call(b->right.get());
+        if (auto* u = dynamic_cast<const UnaryExpr*>(n))
+            return contains_call(u->expr.get());
+        return false;
+    }
+
     void gen_call(const CallExpr* call) {
         int n = (int)call->args.size();
-        // 先求值所有参数存到临时区（嵌套调用不会破坏已暂存的参数）
-        int base = extra_stack_;
-        for (int i = 0; i < n; i++) {
-            gen_expr(call->args[i].get());
-            extra_stack_ += 4;
-            out_ << "    sw t0, " << (temp_base_ + extra_stack_) << "(sp)\n";
+        // 参数里含嵌套调用 → 全部暂存临时区，避免内层调用覆盖已就位的 a 寄存器
+        bool has_call = false;
+        for (auto& a : call->args)
+            if (contains_call(a.get())) { has_call = true; break; }
+
+        if (has_call) {
+            int base = extra_stack_;
+            for (int i = 0; i < n; i++) {
+                gen_expr(call->args[i].get());
+                extra_stack_ += 4;
+                out_ << "    sw t0, " << (temp_base_ + extra_stack_) << "(sp)\n";
+            }
+            // 寄存器参数 a0-a7（全部求值完再从暂存区读回）
+            for (int i = 0; i < std::min(n, 8); i++) {
+                out_ << "    lw t0, " << (temp_base_ + base + (i + 1) * 4) << "(sp)\n";
+                out_ << "    mv " << arg_reg(i) << ", t0\n";
+            }
+            // 溢出参数：存到 sp 负偏移（调用者栈下方，callee 会找到）
+            for (int i = 8; i < n; i++) {
+                out_ << "    lw t0, " << (temp_base_ + base + (i + 1) * 4) << "(sp)\n";
+                out_ << "    sw t0, -" << ((i - 8 + 2) * 4) << "(sp)\n";  // -8, -12, ... 避开 ra 的 -4
+            }
+            extra_stack_ = base;  // 清理本层暂存
+        } else {
+            // 无嵌套调用：求值后直接移入 a 寄存器（快）
+            for (int i = 0; i < std::min(n, 8); i++) {
+                gen_expr(call->args[i].get());
+                out_ << "    mv " << arg_reg(i) << ", t0\n";
+            }
+            // 溢出参数
+            for (int i = 8; i < n; i++) {
+                gen_expr(call->args[i].get());
+                out_ << "    sw t0, -" << ((i - 8 + 2) * 4) << "(sp)\n";
+            }
         }
-        // 寄存器参数 a0-a7（全部求值完再从暂存区读回）
-        for (int i = 0; i < std::min(n, 8); i++) {
-            out_ << "    lw t0, " << (temp_base_ + base + (i + 1) * 4) << "(sp)\n";
-            out_ << "    mv " << arg_reg(i) << ", t0\n";
-        }
-        // 溢出参数：存到 sp 负偏移（调用者栈下方，callee 会找到）
-        for (int i = 8; i < n; i++) {
-            out_ << "    lw t0, " << (temp_base_ + base + (i + 1) * 4) << "(sp)\n";
-            out_ << "    sw t0, -" << ((i - 8 + 2) * 4) << "(sp)\n";  // -8, -12, ... 避开 ra 的 -4
-        }
-        extra_stack_ = base;  // 清理本层暂存
         out_ << "    call " << call->func_name << "\n";
         out_ << "    mv t0, a0\n";
     }
