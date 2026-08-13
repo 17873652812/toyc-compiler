@@ -1,7 +1,6 @@
 #pragma once
 
 #include "ast.h"
-#include "ir_backend.h"
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -40,21 +39,8 @@ public:
 
         out_ << ".text\n";
         // 不定义 _start —— 评测系统的 C 运行时会提供 _start 并调用 main
-        if (opt_) {
-            // -opt：走 IR 后端（降级 → 优化 → 寄存器分配 → 发射）
-            IrBuilder builder(unit_);
-            for (const auto& func : unit_.funcs) {
-                IrFunc ir = builder.lower(func.get());
-                optimize_ir(ir);
-                RegAlloc ra;
-                ra.run(ir);
-                out_ << emit_function(ir, ra);
-            }
-        } else {
-            // 非 -opt：保留原实现（功能测试依赖，零风险）
-            for (const auto& func : unit_.funcs)
-                gen_func(func.get());
-        }
+        for (const auto& func : unit_.funcs)
+            gen_func(func.get());
         return out_.str();
     }
 
@@ -91,6 +77,13 @@ private:
     int temp_base_ = 0;         // 临时区基址（-opt 时 =0，帧底）
     int var_base_ = 0;          // 溢出变量区基址
     int temp_limit_ = 256;      // 临时区大小（字节）
+
+    // ---- CSE（公共子表达式消除，-opt 用） ----
+    static const int CSE_SLOTS = 8;    // CSE 结果缓存槽位个数
+    int cse_base_ = 0;                  // CSE 存储区基址（帧内偏移）
+    int cse_count_ = 0;                 // 已占用的 CSE 槽位数
+    struct CseEntry { std::string left, right; int slot; };  // 两个操作数标记 + 槽位号
+    std::unordered_map<std::string, CseEntry> cse_map_;      // key(op,左,右) → 条目
 
     std::vector<int> scope_reg_base_;   // 每个作用域进入时的寄存器水位（-opt 回收用）
     std::vector<int> scope_off_base_;   // 每个作用域进入时的栈偏移水位
@@ -368,7 +361,8 @@ private:
     // ---- 函数 ----
 
     void gen_func(const FuncDef* func) {
-        gen_func_orig(func);
+        if (opt_) gen_func_opt(func);
+        else gen_func_orig(func);
     }
 
     // 非 -opt：保持原实现（功能测试走这里，零风险）
@@ -436,6 +430,131 @@ private:
         out_ << "    ret\n\n";
     }
 
+    // -opt：寄存器分配 + 帧重构 + 尾递归
+    void gen_func_opt(const FuncDef* func) {
+        current_func_ = func->name;
+        current_params_ = func->params;
+        current_param_vars_.clear();   // 关键：清空上一个函数的参数位置
+        symtab_.clear(); symtab_.push_back({});
+        consts_.clear(); consts_.push_back({});
+        extra_stack_ = 0;
+        next_offset_ = 0;
+        next_reg_ = 0;
+        max_reg_used_ = 0;
+        max_offset_used_ = 0;
+        scope_reg_base_.clear();
+        scope_off_base_.clear();
+        copy_tab_.clear();
+        copy_stack_.clear();
+        reg_temp_depth_ = 0;
+        loops_.clear();
+
+        // 预分析：临时区大小
+        int np = (int)func->params.size();
+        int nstack = std::max(0, np - 8);   // 栈参数个数
+        int mmt = 0, max_tail = 0;
+        for (auto& s : func->body->stmts) {
+            mmt = std::max(mmt, max_mem_temp_stmt(s.get()));
+            max_tail = std::max(max_tail, max_tail_args(s.get()));
+        }
+        int expr_area = 4 * (mmt + 8);    // 表达式临时区大小
+        temp_base_ = 0;                    // 临时区在帧底
+        cse_base_ = expr_area;             // CSE 存储区（表达式区之上）
+        temp_limit_ = expr_area + CSE_SLOTS * 4 + 4 * max_tail + 4 * nstack + 16;
+        var_base_ = temp_limit_;           // 溢出变量在暂存区之上
+        cse_count_ = 0; cse_map_.clear();
+
+        // 分配形参（优先寄存器）
+        for (auto& p : func->params) {
+            alloc_var(p);
+            current_param_vars_.push_back(symtab_.back()[p]);
+        }
+
+        // 先生成函数体到缓冲区，统计实际用到的寄存器/变量数
+        std::ostringstream body_buf;
+        out_.swap(body_buf);
+        for (auto& s : func->body->stmts) {
+            gen_stmt(s.get());
+            if (is_terminator(s.get())) break;  // 死代码：return/break/continue 后跳过
+        }
+        std::string body_str = out_.str();
+        out_.swap(body_buf);
+
+        // 计算帧大小
+        int n_spilled = max_offset_used_ / 4;   // 用最大值，块回收后仍留足空间
+        int n_saved = max_reg_used_;   // 保存整个函数用到的所有 s 寄存器（含已回收块的）
+        int frame = temp_limit_ + n_spilled * 4 + n_saved * 4 + 4;
+        if (np > 8) frame = std::max(frame, (np - 7) * 4);  // 栈参数读取区
+        if (frame < 16) frame = 16;
+        frame = (frame + 15) & ~15;
+        stack_size_ = frame;
+        int save_base = temp_limit_ + n_spilled * 4;  // s 寄存器保存区
+
+        // prologue
+        out_ << ".globl " << func->name << "\n" << func->name << ":\n";
+        out_ << "    addi sp, sp, -" << frame << "\n";
+        out_ << "    sw ra, " << (frame - 4) << "(sp)\n";
+
+        // 读入栈参数（i>=8）暂存到临时区顶部
+        for (int i = 8; i < np; i++) {
+            int caller_off = frame - (i - 8 + 2) * 4;
+            int stage_off = temp_limit_ - (nstack - (i - 8)) * 4;
+            out_ << "    lw t0, " << caller_off << "(sp)\n";
+            out_ << "    sw t0, " << stage_off << "(sp)\n";
+        }
+        // 保存用到的 s 寄存器（callee-saved，调用者值保留）
+        for (int k = 0; k < n_saved; k++)
+            out_ << "    sw s" << k << ", " << (save_base + k * 4) << "(sp)\n";
+        // 绑定 a0-a7 参数
+        for (int i = 0; i < np && i < 8; i++) {
+            VarLoc loc = current_param_vars_[i];
+            if (loc.in_reg) out_ << "    mv s" << loc.reg << ", a" << i << "\n";
+            else out_ << "    sw a" << i << ", " << loc.off << "(sp)\n";
+        }
+        // 绑定栈参数
+        for (int i = 8; i < np; i++) {
+            VarLoc loc = current_param_vars_[i];
+            int stage_off = temp_limit_ - (nstack - (i - 8)) * 4;
+            out_ << "    lw t0, " << stage_off << "(sp)\n";
+            if (loc.in_reg) out_ << "    mv s" << loc.reg << ", t0\n";
+            else out_ << "    sw t0, " << loc.off << "(sp)\n";
+        }
+
+        // 尾递归入口标签
+        if (stmt_has_tail_call(func->body.get()))
+            out_ << ".L" << func->name << "_start:\n";
+
+        // 函数体
+        out_ << body_str;
+
+        // epilogue
+        out_ << ".L" << func->name << "_exit:\n";
+        for (int k = n_saved - 1; k >= 0; k--)
+            out_ << "    lw s" << k << ", " << (save_base + k * 4) << "(sp)\n";
+        out_ << "    lw ra, " << (frame - 4) << "(sp)\n";
+        out_ << "    addi sp, sp, " << frame << "\n";
+        out_ << "    ret\n\n";
+    }
+
+    // 尾递归调用：return 当前函数(新参数) → 绑定参数后跳回函数头
+    void gen_tail_call(const CallExpr* call) {
+        int n = (int)call->args.size();
+        // 先求值所有参数，暂存到临时区顶部（避开参数求值用的低区）
+        for (int i = 0; i < n; i++) {
+            gen_expr(call->args[i].get());
+            out_ << "    sw t0, " << (temp_limit_ - (n - i) * 4) << "(sp)\n";
+        }
+        // 按序绑定到形参位置
+        for (int i = 0; i < n; i++) {
+            out_ << "    lw t0, " << (temp_limit_ - (n - i) * 4) << "(sp)\n";
+            VarLoc loc = current_param_vars_[i];
+            if (loc.in_reg) out_ << "    mv s" << loc.reg << ", t0\n";
+            else out_ << "    sw t0, " << loc.off << "(sp)\n";
+        }
+        cse_clear();   // 形参被重新绑定为新值，以形参为操作数的 CSE 缓存全部失效
+        out_ << "    j .L" << current_func_ << "_start\n";
+    }
+
     void gen_block(const Block* block) {
         enter_scope();
         for (auto& s : block->stmts) {
@@ -485,6 +604,7 @@ private:
                         copy_tab_[vd->name] = copy_source(sid->name);
                     }
                 }
+                cse_invalidate(vd->name);   // 新变量可能遮蔽同名旧变量，CSE 失效
             }
             gen_expr(vd->init.get());
             VarLoc loc = alloc_var(vd->name);
@@ -497,6 +617,7 @@ private:
             if (opt_) {
                 // 赋值目标 x 被修改：清除 x 自身的副本，以及所有依赖 x 的副本
                 invalidate_copy(as->name);
+                cse_invalidate(as->name);   // 变量被赋值，以它为操作数的缓存失效
                 if (auto* sid = dynamic_cast<const IdExpr*>(as->expr.get())) {
                     // x = y → 记录 x 的来源（压缩链到最终源）
                     if (find_var(sid->name) && !global_vars_.count(sid->name)) {
@@ -529,7 +650,8 @@ private:
                 // 避免深尾递归栈溢出——评测 p06 的根因）
                 if (call && call->func_name == current_func_
                     && call->args.size() == current_params_.size()) {
-                    // 参数都在栈槽。先把实参求值并暂存，再按序写入参数槽。
+                    if (opt_) { gen_tail_call(call); return; }
+                    // 非-opt：参数都在栈槽。先把实参求值并暂存，再按序写入参数槽。
                     // 用临时区顶部暂存，避开表达式求值用的低区。
                     int n = (int)call->args.size();
                     int base = extra_stack_;
@@ -560,6 +682,7 @@ private:
             return;
         }
         if (auto* ifs = dynamic_cast<const IfStmt*>(stmt)) {
+            if (opt_) cse_clear();   // 分支点：跨分支的缓存不安全，整体清空
             // 常数条件：直接选分支（-opt）
             if (opt_) {
                 if (auto v = try_fold(ifs->cond.get())) {
@@ -579,6 +702,7 @@ private:
             return;
         }
         if (auto* ws = dynamic_cast<const WhileStmt*>(stmt)) {
+            if (opt_) cse_clear();   // 循环入口：跨迭代缓存置空，保证安全
             // while(0)：永不执行，整段删除（-opt）
             if (opt_) {
                 if (auto v = try_fold(ws->cond.get())) {
@@ -666,50 +790,25 @@ private:
             // 短路计算（v1.0）
             if (bin->op == "&&") { gen_short_circuit_and(bin); return; }
             if (bin->op == "||") { gen_short_circuit_or(bin); return; }
-            // 代数化简（-opt）
-            if (opt_ && simplify_binary(bin)) return;
-            // 寄存器操作数优化（-opt）：左右操作数若是 s 寄存器变量，直接用作操作数，
-            // 省掉 mv 搬运。只在右子树无调用（t 寄存器安全）且非短路时用。
-            if (opt_ && !contains_call(bin->right.get())) {
-                std::string lr = simple_var_reg(bin->left.get());   // 左是变量→"sX"，否则空
-                std::string rr = simple_var_reg(bin->right.get());  // 右是变量→"sY"，否则空
-                if (!lr.empty() && !rr.empty()) {
-                    // 左右都是寄存器变量：add t0, sX, sY（一条指令）
-                    gen_bin_op2(bin->op, lr, rr);
-                    return;
-                }
-                if (!rr.empty()) {
-                    // 右是变量：先算左到 t0，再 op t0, t0, sY
-                    gen_expr(bin->left.get());
-                    gen_bin_op2(bin->op, "t0", rr);
-                    return;
-                }
-                if (!lr.empty()) {
-                    // 左是变量：先算右到 t0，再 op t0, sX, t0
-                    gen_expr(bin->right.get());
-                    gen_bin_op2(bin->op, lr, "t0");
+            // CSE（-opt）：简单操作数（变量/常量）的重复子表达式 → 复用缓存结果
+            if (opt_) {
+                CseKey ck = cse_make_key(bin);
+                if (!ck.key.empty()) {
+                    auto it = cse_map_.find(ck.key);
+                    if (it != cse_map_.end()) {
+                        out_ << "    lw t0, " << (cse_base_ + it->second.slot * 4) << "(sp)\n";
+                        return;
+                    }
+                    gen_bin_expr(bin);           // 首次计算，结果在 t0
+                    if (cse_count_ < CSE_SLOTS) {
+                        int slot = cse_count_++;
+                        out_ << "    sw t0, " << (cse_base_ + slot * 4) << "(sp)\n";
+                        cse_map_[ck.key] = {ck.l, ck.r, slot};
+                    }
                     return;
                 }
             }
-
-            // 普通二元运算
-            gen_expr(bin->left.get());
-            // 左值暂存：深度<5 且右子树无调用时用寄存器 t1-t5；
-            // 否则用内存（弹回 t6，t6 专做临时，不参与寄存器临时值，绝不覆盖外层值）
-            if (opt_ && reg_temp_depth_ < 5 && !contains_call(bin->right.get())) {
-                reg_temp_depth_++;
-                out_ << "    mv t" << reg_temp_depth_ << ", t0\n";
-                gen_expr(bin->right.get());
-                gen_bin_op(bin->op, "t" + std::to_string(reg_temp_depth_));
-                reg_temp_depth_--;
-            } else {
-                extra_stack_ += 4;
-                out_ << "    sw t0, " << (temp_base_ + extra_stack_) << "(sp)\n";
-                gen_expr(bin->right.get());
-                out_ << "    lw t6, " << (temp_base_ + extra_stack_) << "(sp)\n";
-                extra_stack_ -= 4;
-                gen_bin_op(bin->op, "t6");
-            }
+            gen_bin_expr(bin);
             return;
         }
         if (auto* un = dynamic_cast<const UnaryExpr*>(expr)) {
@@ -719,6 +818,54 @@ private:
             gen_call(call); return;
         }
         throw std::runtime_error("Codegen: unknown expression");
+    }
+
+    // 生成二元运算，结果在 t0（含代数化简、寄存器操作数、临时值处理）
+    void gen_bin_expr(const BinaryExpr* bin) {
+        // 代数化简（-opt）
+        if (opt_ && simplify_binary(bin)) return;
+        // 寄存器操作数优化（-opt）：左右操作数若是 s 寄存器变量，直接用作操作数，
+        // 省掉 mv 搬运。只在右子树无调用（t 寄存器安全）且非短路时用。
+        if (opt_ && !contains_call(bin->right.get())) {
+            std::string lr = simple_var_reg(bin->left.get());   // 左是变量→"sX"，否则空
+            std::string rr = simple_var_reg(bin->right.get());  // 右是变量→"sY"，否则空
+            if (!lr.empty() && !rr.empty()) {
+                // 左右都是寄存器变量：add t0, sX, sY（一条指令）
+                gen_bin_op2(bin->op, lr, rr);
+                return;
+            }
+            if (!rr.empty()) {
+                // 右是变量：先算左到 t0，再 op t0, t0, sY
+                gen_expr(bin->left.get());
+                gen_bin_op2(bin->op, "t0", rr);
+                return;
+            }
+            if (!lr.empty()) {
+                // 左是变量：先算右到 t0，再 op t0, sX, t0
+                gen_expr(bin->right.get());
+                gen_bin_op2(bin->op, lr, "t0");
+                return;
+            }
+        }
+
+        // 普通二元运算
+        gen_expr(bin->left.get());
+        // 左值暂存：深度<5 且右子树无调用时用寄存器 t1-t5；
+        // 否则用内存（弹回 t6，t6 专做临时，不参与寄存器临时值，绝不覆盖外层值）
+        if (opt_ && reg_temp_depth_ < 5 && !contains_call(bin->right.get())) {
+            reg_temp_depth_++;
+            out_ << "    mv t" << reg_temp_depth_ << ", t0\n";
+            gen_expr(bin->right.get());
+            gen_bin_op(bin->op, "t" + std::to_string(reg_temp_depth_));
+            reg_temp_depth_--;
+        } else {
+            extra_stack_ += 4;
+            out_ << "    sw t0, " << (temp_base_ + extra_stack_) << "(sp)\n";
+            gen_expr(bin->right.get());
+            out_ << "    lw t6, " << (temp_base_ + extra_stack_) << "(sp)\n";
+            extra_stack_ -= 4;
+            gen_bin_op(bin->op, "t6");
+        }
     }
 
     // 代数化简：x+0, x-0, x*1, x*0, x*2^k, x/1, x%1
@@ -805,6 +952,44 @@ private:
         }
         return false;
     }
+
+    // ---- CSE（公共子表达式消除） ----
+
+    // 操作数标记：局部变量→"v名字"、常量→"c值"；全局/复制源变量/复杂表达式→""（不做CSE）
+    std::string cse_operand(const ASTNode* e) {
+        if (auto* n = dynamic_cast<const NumberExpr*>(e)) return "c" + std::to_string(n->value);
+        if (auto* id = dynamic_cast<const IdExpr*>(e)) {
+            if (global_vars_.count(id->name)) return "";   // 全局可能被调用修改，不安全
+            if (copy_tab_.count(id->name)) return "";      // 复制源变量值跟随源，缓存失效难追踪
+            return "v" + id->name;                          // 局部变量或 const（const 不变，安全）
+        }
+        return "";
+    }
+
+    // 构造 CSE 键：两个简单操作数才可缓存；key 为空表示不可 CSE
+    struct CseKey { std::string key, l, r; };
+    CseKey cse_make_key(const BinaryExpr* bin) {
+        CseKey ck;
+        ck.l = cse_operand(bin->left.get());
+        ck.r = cse_operand(bin->right.get());
+        if (ck.l.empty() || ck.r.empty()) { ck.key = ""; return ck; }
+        // 交换律运算（+ *）统一操作数顺序，a*b 与 b*a 视为同一表达式
+        if ((bin->op == "+" || bin->op == "*") && ck.l > ck.r) std::swap(ck.l, ck.r);
+        ck.key = bin->op + "|" + ck.l + "|" + ck.r;
+        return ck;
+    }
+
+    // 变量 x 被赋值/声明后：删掉所有以 x 为操作数的缓存条目（值已过时）
+    void cse_invalidate(const std::string& x) {
+        std::string mark = "v" + x;
+        for (auto it = cse_map_.begin(); it != cse_map_.end(); ) {
+            if (it->second.left == mark || it->second.right == mark)
+                it = cse_map_.erase(it);
+            else ++it;
+        }
+    }
+
+    void cse_clear() { cse_map_.clear(); }
 
     // ---- 函数调用 ----
 
