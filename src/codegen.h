@@ -184,7 +184,10 @@ private:
         }
 
         // 函数体直接遍历，不通过 gen_block（避免重复 enter_scope）
-        for (auto& s : func->body->stmts) gen_stmt(s.get());
+        for (auto& s : func->body->stmts) {
+            gen_stmt(s.get());
+            if (is_terminator(s.get())) break;   // 死代码：return 后语句不可达，跳过
+        }
 
         // 尾声：恢复 s 寄存器 + ra
         out_ << ".L" << func->name << "_exit:\n";
@@ -195,9 +198,19 @@ private:
         out_ << "    ret\n\n";
     }
 
+    // 该语句是否无条件结束当前块（return/break/continue）——用于死代码删除
+    bool is_terminator(const ASTNode* s) {
+        return dynamic_cast<const ReturnStmt*>(s)
+            || dynamic_cast<const BreakStmt*>(s)
+            || dynamic_cast<const ContinueStmt*>(s);
+    }
+
     void gen_block(const Block* block) {
         enter_scope();
-        for (auto& s : block->stmts) gen_stmt(s.get());
+        for (auto& s : block->stmts) {
+            gen_stmt(s.get());
+            if (is_terminator(s.get())) break;   // 死代码：后续语句不可达，跳过
+        }
         exit_scope();
     }
 
