@@ -68,6 +68,13 @@ private:
     int next_reg_ = 0;        // 下一个可用的 s 寄存器编号（0-11）
     int max_reg_used_ = 0;    // 本函数实际用到的最大 s 寄存器数（保存/恢复用）
 
+    // ---- CSE（公共子表达式消除） ----
+    static const int CSE_SLOTS = 8;   // CSE 结果缓存槽位数
+    int cse_base_ = 0;                 // CSE 存储区基址（帧内偏移）
+    int cse_count_ = 0;                // 已用槽位数
+    struct CseEntry { std::string l, r; int slot; };  // 两操作数标记 + 槽位
+    std::unordered_map<std::string, CseEntry> cse_map_;  // key(op,l,r) → 条目
+
     void enter_scope() { symtab_.push_back({}); consts_.push_back({}); }
     void exit_scope() { symtab_.pop_back(); consts_.pop_back(); }
 
@@ -151,13 +158,15 @@ private:
         int total_vars = (int)func->params.size() + nvars;
         int n_reg = std::min(total_vars, 12);   // 最多 12 个 s 寄存器
 
-        // 帧布局：[溢出变量区][s寄存器保存区][ra][临时区]
+        // 帧布局：[溢出变量区][s寄存器保存区][临时区][CSE区][ra]
         int sreg_save_base = total_vars * 4;    // 溢出变量区之后（安全边界）
-        int frame_size = total_vars * 4 + n_reg * 4 + 4 + 256;  // +256 临时值缓冲区
+        temp_base_ = total_vars * 4 + n_reg * 4 + 4;  // 临时区在保存区之后
+        cse_base_ = temp_base_ + 256;           // CSE 区在临时区(256字节)之后
+        int frame_size = cse_base_ + CSE_SLOTS * 4 + 4;  // CSE + ra
         if (frame_size < 16) frame_size = 16;
         frame_size = (frame_size + 15) & ~15;
         stack_size_ = frame_size;
-        temp_base_ = total_vars * 4 + n_reg * 4 + 4;  // 临时区在保存区之后
+        cse_count_ = 0; cse_map_.clear();
 
         out_ << ".globl " << func->name << "\n" << func->name << ":\n";
         out_ << "    addi sp, sp, -" << stack_size_ << "\n";
@@ -228,6 +237,7 @@ private:
 
         if (auto* vd = dynamic_cast<const VarDecl*>(stmt)) {
             gen_expr(vd->init.get());
+            cse_invalidate(vd->name);   // 新变量可能遮蔽同名旧变量，CSE 失效
             VarLoc loc = alloc_var(vd->name);
             if (loc.in_reg) out_ << "    mv s" << loc.reg << ", t0\n";
             else out_ << "    sw t0, " << loc.off << "(sp)\n";
@@ -237,6 +247,7 @@ private:
             VarLoc* loc = find_var(as->name);
             if (loc) {
                 gen_expr(as->expr.get());
+                cse_invalidate(as->name);   // 变量被赋值，以它为操作数的缓存失效
                 if (loc->in_reg) out_ << "    mv s" << loc->reg << ", t0\n";
                 else out_ << "    sw t0, " << loc->off << "(sp)\n";
                 return;
@@ -262,17 +273,21 @@ private:
             return;
         }
         if (auto* ifs = dynamic_cast<const IfStmt*>(stmt)) {
+            cse_clear();   // 分支点：跨分支的缓存不安全，整体清空
             int el = new_label(), en = new_label();
             gen_expr(ifs->cond.get());
             out_ << "    beqz t0, .L" << el << "\n";
             gen_stmt(ifs->then_stmt.get());
             out_ << "    j .L" << en << "\n";
             out_ << ".L" << el << ":\n";
+            cse_clear();   // 分支间清空：else 分支不能复用 then 分支的缓存（运行时互斥）
             if (ifs->else_stmt) gen_stmt(ifs->else_stmt.get());
             out_ << ".L" << en << ":\n";
+            cse_clear();   // 汇合点清空：if 之后不能复用任何分支内的缓存
             return;
         }
         if (auto* ws = dynamic_cast<const WhileStmt*>(stmt)) {
+            cse_clear();   // 循环入口：跨迭代缓存置空，保证安全
             int bg = new_label(), en = new_label();
             loops_.push_back({bg, en});
             out_ << ".L" << bg << ":\n";
@@ -337,12 +352,24 @@ private:
             // 短路计算（v1.0）
             if (bin->op == "&&") { gen_short_circuit_and(bin); return; }
             if (bin->op == "||") { gen_short_circuit_or(bin); return; }
-            // 普通二元运算
-            gen_expr(bin->left.get());
-            push_t0();
-            gen_expr(bin->right.get());
-            pop_to_t1();
-            gen_bin_op(bin->op);
+            // CSE（公共子表达式消除）：简单操作数的重复表达式 → 复用缓存结果
+            std::string l, r;
+            std::string key = cse_key(bin, l, r);
+            if (!key.empty()) {
+                auto it = cse_map_.find(key);
+                if (it != cse_map_.end()) {
+                    out_ << "    lw t0, " << (cse_base_ + it->second.slot * 4) << "(sp)\n";
+                    return;
+                }
+                gen_bin_expr(bin);           // 首次计算，结果在 t0
+                if (cse_count_ < CSE_SLOTS) {
+                    int slot = cse_count_++;
+                    out_ << "    sw t0, " << (cse_base_ + slot * 4) << "(sp)\n";
+                    cse_map_[key] = {l, r, slot};
+                }
+                return;
+            }
+            gen_bin_expr(bin);
             return;
         }
         if (auto* un = dynamic_cast<const UnaryExpr*>(expr)) {
@@ -352,6 +379,15 @@ private:
             gen_call(call); return;
         }
         throw std::runtime_error("Codegen: unknown expression");
+    }
+
+    // 生成二元运算，结果在 t0
+    void gen_bin_expr(const BinaryExpr* bin) {
+        gen_expr(bin->left.get());
+        push_t0();
+        gen_expr(bin->right.get());
+        pop_to_t1();
+        gen_bin_op(bin->op);
     }
 
     // ---- 函数调用 ----
@@ -406,6 +442,39 @@ private:
         out_ << "    call " << call->func_name << "\n";
         out_ << "    mv t0, a0\n";
     }
+
+    // ---- CSE（公共子表达式消除） ----
+
+    // 操作数标记：局部变量→"v名字"、常量→"c值"；全局→""（不做CSE，可能被调用改）
+    std::string cse_operand(const ASTNode* e) {
+        if (auto* n = dynamic_cast<const NumberExpr*>(e)) return "c" + std::to_string(n->value);
+        if (auto* id = dynamic_cast<const IdExpr*>(e)) {
+            if (global_vars_.count(id->name)) return "";
+            return "v" + id->name;
+        }
+        return "";
+    }
+
+    // 构造 CSE 键；两个简单操作数才可缓存，key 为空表示不可 CSE
+    std::string cse_key(const BinaryExpr* bin, std::string& l, std::string& r) {
+        l = cse_operand(bin->left.get());
+        r = cse_operand(bin->right.get());
+        if (l.empty() || r.empty()) return "";
+        if ((bin->op == "+" || bin->op == "*") && l > r) std::swap(l, r);  // 交换律统一顺序
+        return bin->op + "|" + l + "|" + r;
+    }
+
+    // 变量 x 被赋值/声明后：删掉以 x 为操作数的缓存条目（值已过时）
+    void cse_invalidate(const std::string& x) {
+        std::string mark = "v" + x;
+        for (auto it = cse_map_.begin(); it != cse_map_.end(); ) {
+            if (it->second.l == mark || it->second.r == mark)
+                it = cse_map_.erase(it);
+            else ++it;
+        }
+    }
+
+    void cse_clear() { cse_map_.clear(); }
 
     // ---- 短路计算（v1.0） ----
 
