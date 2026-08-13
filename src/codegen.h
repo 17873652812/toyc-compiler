@@ -55,22 +55,38 @@ private:
     const CompUnit& unit_;
     bool opt_;
     std::ostringstream out_;
+    // 变量位置：s 寄存器（s0-s11）或栈偏移
+    struct VarLoc {
+        bool in_reg = false;  // 在寄存器中
+        int reg = 0;          // s 寄存器编号 0-11
+        int off = 0;          // 栈偏移（溢出变量）
+    };
     // 栈式作用域：每个 Block 进入时 push 一个作用域，离开时 pop
-    std::vector<std::unordered_map<std::string, int>> symtab_{1};
+    std::vector<std::unordered_map<std::string, VarLoc>> symtab_{1};
     std::vector<std::unordered_map<std::string, int>> consts_{1};  // v1.0
     int stack_size_ = 0, label_count_ = 0, extra_stack_ = 0, next_offset_ = 0;
+    int next_reg_ = 0;        // 下一个可用的 s 寄存器编号（0-11）
+    int max_reg_used_ = 0;    // 本函数实际用到的最大 s 寄存器数（保存/恢复用）
 
     void enter_scope() { symtab_.push_back({}); consts_.push_back({}); }
     void exit_scope() { symtab_.pop_back(); consts_.pop_back(); }
 
-    int alloc_var(const std::string& name) {
-        int off = next_offset_; next_offset_ += 4;
-        symtab_.back()[name] = off;
-        return off;
+    // 分配变量位置：优先 s 寄存器，超 12 个溢出到栈
+    VarLoc alloc_var(const std::string& name) {
+        VarLoc loc;
+        if (next_reg_ < 12) {
+            loc.in_reg = true;
+            loc.reg = next_reg_++;
+            if (next_reg_ > max_reg_used_) max_reg_used_ = next_reg_;
+        } else {
+            loc.off = next_offset_; next_offset_ += 4;
+        }
+        symtab_.back()[name] = loc;
+        return loc;
     }
 
     // 从内到外查找变量
-    int* find_var(const std::string& name) {
+    VarLoc* find_var(const std::string& name) {
         for (int i = (int)symtab_.size() - 1; i >= 0; i--) {
             auto it = symtab_[i].find(name);
             if (it != symtab_[i].end()) return &it->second;
@@ -126,39 +142,54 @@ private:
         consts_.clear(); consts_.push_back({});
         extra_stack_ = 0;
         next_offset_ = 0;
+        next_reg_ = 0;
+        max_reg_used_ = 0;
 
-        // 参数 slot
+        // 参数分配位置（优先寄存器）
         for (auto& p : func->params) alloc_var(p);
         int nvars = count_vars(func->body.get());
         int total_vars = (int)func->params.size() + nvars;
-        int frame_size = total_vars * 4 + 4 + 256;  // +256 临时值缓冲区
+        int n_reg = std::min(total_vars, 12);   // 最多 12 个 s 寄存器
+
+        // 帧布局：[溢出变量区][s寄存器保存区][ra][临时区]
+        int sreg_save_base = total_vars * 4;    // 溢出变量区之后（安全边界）
+        int frame_size = total_vars * 4 + n_reg * 4 + 4 + 256;  // +256 临时值缓冲区
         if (frame_size < 16) frame_size = 16;
         frame_size = (frame_size + 15) & ~15;
         stack_size_ = frame_size;
-        temp_base_ = total_vars * 4 + 4;  // 变量区之后，ra之前
+        temp_base_ = total_vars * 4 + n_reg * 4 + 4;  // 临时区在保存区之后
 
         out_ << ".globl " << func->name << "\n" << func->name << ":\n";
         out_ << "    addi sp, sp, -" << stack_size_ << "\n";
         out_ << "    sw ra, " << (stack_size_ - 4) << "(sp)\n";
 
+        // 保存本函数用到的 s 寄存器（callee-saved，调用者值保留）
+        for (int k = 0; k < n_reg; k++)
+            out_ << "    sw s" << k << ", " << (sreg_save_base + k * 4) << "(sp)\n";
+
         // 保存寄存器参数（a0-a7）+ 栈参数（从调用者栈读取）
         int np = (int)func->params.size();
         for (int i = 0; i < np; i++) {
-            int off = symtab_.back()[func->params[i]];
-            if (i < 8)
-                out_ << "    sw " << arg_reg(i) << ", " << off << "(sp)\n";
-            else {
+            VarLoc loc = symtab_.back()[func->params[i]];
+            if (i < 8) {
+                if (loc.in_reg) out_ << "    mv s" << loc.reg << ", " << arg_reg(i) << "\n";
+                else out_ << "    sw " << arg_reg(i) << ", " << loc.off << "(sp)\n";
+            } else {
                 // 栈参数：调用者存在 sp 负偏移，callee 用 stack_size_ - N 读取
                 int caller_off = stack_size_ - (i - 8 + 2) * 4;  // 对应调用者的 -8, -12, ...
                 out_ << "    lw t0, " << caller_off << "(sp)\n";
-                out_ << "    sw t0, " << off << "(sp)\n";
+                if (loc.in_reg) out_ << "    mv s" << loc.reg << ", t0\n";
+                else out_ << "    sw t0, " << loc.off << "(sp)\n";
             }
         }
 
         // 函数体直接遍历，不通过 gen_block（避免重复 enter_scope）
         for (auto& s : func->body->stmts) gen_stmt(s.get());
 
+        // 尾声：恢复 s 寄存器 + ra
         out_ << ".L" << func->name << "_exit:\n";
+        for (int k = n_reg - 1; k >= 0; k--)
+            out_ << "    lw s" << k << ", " << (sreg_save_base + k * 4) << "(sp)\n";
         out_ << "    lw ra, " << (stack_size_ - 4) << "(sp)\n";
         out_ << "    addi sp, sp, " << stack_size_ << "\n";
         out_ << "    ret\n\n";
@@ -184,15 +215,17 @@ private:
 
         if (auto* vd = dynamic_cast<const VarDecl*>(stmt)) {
             gen_expr(vd->init.get());
-            int off = alloc_var(vd->name);
-            out_ << "    sw t0, " << off << "(sp)\n";
+            VarLoc loc = alloc_var(vd->name);
+            if (loc.in_reg) out_ << "    mv s" << loc.reg << ", t0\n";
+            else out_ << "    sw t0, " << loc.off << "(sp)\n";
             return;
         }
         if (auto* as = dynamic_cast<const AssignStmt*>(stmt)) {
-            int* off = find_var(as->name);
-            if (off) {
+            VarLoc* loc = find_var(as->name);
+            if (loc) {
                 gen_expr(as->expr.get());
-                out_ << "    sw t0, " << *off << "(sp)\n";
+                if (loc->in_reg) out_ << "    mv s" << loc->reg << ", t0\n";
+                else out_ << "    sw t0, " << loc->off << "(sp)\n";
                 return;
             }
             // 全局变量赋值（v1.0）
@@ -272,8 +305,12 @@ private:
             // 查找顺序：常量 > 局部变量 > 全局变量
             int* cv = find_const(id->name);
             if (cv) { out_ << "    li t0, " << *cv << "\n"; return; }
-            int* off = find_var(id->name);
-            if (off) { out_ << "    lw t0, " << *off << "(sp)\n"; return; }
+            VarLoc* loc = find_var(id->name);
+            if (loc) {
+                if (loc->in_reg) out_ << "    mv t0, s" << loc->reg << "\n";
+                else out_ << "    lw t0, " << loc->off << "(sp)\n";
+                return;
+            }
             auto gi = global_vars_.find(id->name);
             if (gi != global_vars_.end()) {
                 // 从全局标签加载（支持运行时修改）
