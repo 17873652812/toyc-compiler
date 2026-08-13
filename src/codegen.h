@@ -67,6 +67,7 @@ private:
     int stack_size_ = 0, label_count_ = 0, extra_stack_ = 0, next_offset_ = 0;
     int next_reg_ = 0;        // 下一个可用的 s 寄存器编号（0-11）
     int max_reg_used_ = 0;    // 本函数实际用到的最大 s 寄存器数（保存/恢复用）
+    std::vector<int> scope_reg_base_;   // 每个作用域进入时的寄存器水位（退出时回收）
 
     // ---- CSE（公共子表达式消除） ----
     static const int CSE_SLOTS = 8;   // CSE 结果缓存槽位数
@@ -75,8 +76,16 @@ private:
     struct CseEntry { std::string l, r; int slot; };  // 两操作数标记 + 槽位
     std::unordered_map<std::string, CseEntry> cse_map_;  // key(op,l,r) → 条目
 
-    void enter_scope() { symtab_.push_back({}); consts_.push_back({}); }
-    void exit_scope() { symtab_.pop_back(); consts_.pop_back(); }
+    // 进入/退出作用域：记录寄存器水位，退出时回收块内变量占用的寄存器
+    void enter_scope() {
+        symtab_.push_back({}); consts_.push_back({});
+        scope_reg_base_.push_back(next_reg_);
+    }
+    void exit_scope() {
+        symtab_.pop_back(); consts_.pop_back();
+        next_reg_ = scope_reg_base_.back();   // 回收块内寄存器
+        scope_reg_base_.pop_back();
+    }
 
     // 分配变量位置：优先 s 寄存器，超 12 个溢出到栈
     VarLoc alloc_var(const std::string& name) {
@@ -151,6 +160,7 @@ private:
         next_offset_ = 0;
         next_reg_ = 0;
         max_reg_used_ = 0;
+        scope_reg_base_.clear();
 
         // 参数分配位置（优先寄存器）
         for (auto& p : func->params) alloc_var(p);
@@ -288,6 +298,9 @@ private:
         }
         if (auto* ws = dynamic_cast<const WhileStmt*>(stmt)) {
             cse_clear();   // 循环入口：跨迭代缓存置空，保证安全
+            // 死代码：while(0) 永不执行，整段跳过（字面量 0，无副作用）
+            if (auto* n = dynamic_cast<const NumberExpr*>(ws->cond.get()))
+                if (n->value == 0) return;
             int bg = new_label(), en = new_label();
             loops_.push_back({bg, en});
             out_ << ".L" << bg << ":\n";
