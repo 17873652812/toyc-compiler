@@ -184,7 +184,7 @@ private:
     }
     int count_vars_in_stmt(const ASTNode* s) {
         if (auto* b = dynamic_cast<const Block*>(s)) return count_vars(b);
-        if (auto* vd = dynamic_cast<const VarDecl*>(s)) return 1;
+        if (dynamic_cast<const VarDecl*>(s)) return 1;
         return 0;
     }
 
@@ -211,7 +211,7 @@ private:
             return std::max(L, 1 + R);  // 左值占 1 槽 + 右子树深度
         }
         if (auto* u = dynamic_cast<const UnaryExpr*>(n)) return max_mem_temp_expr(u->expr.get());
-        if (auto* c = dynamic_cast<const CallExpr*>(n)) {
+        if (dynamic_cast<const CallExpr*>(n)) {
             // gen_call 会先把所有参数暂存到临时区（n 槽，从当前 base 开始）。
             // 参数求值中可能嵌套调用，嵌套层数深度未知，保守按每层都叠加：
             // 调用链深度 × 参数槽数。用一个辅助函数算「调用链上所有调用参数槽之和」
@@ -368,8 +368,7 @@ private:
     // ---- 函数 ----
 
     void gen_func(const FuncDef* func) {
-        if (opt_) gen_func_opt(func);
-        else gen_func_orig(func);
+        gen_func_orig(func);
     }
 
     // 非 -opt：保持原实现（功能测试走这里，零风险）
@@ -435,127 +434,6 @@ private:
         out_ << "    lw ra, " << (stack_size_ - 4) << "(sp)\n";
         out_ << "    addi sp, sp, " << stack_size_ << "\n";
         out_ << "    ret\n\n";
-    }
-
-    // -opt：寄存器分配 + 帧重构 + 尾递归
-    void gen_func_opt(const FuncDef* func) {
-        current_func_ = func->name;
-        current_params_ = func->params;
-        current_param_vars_.clear();   // 关键：清空上一个函数的参数位置
-        symtab_.clear(); symtab_.push_back({});
-        consts_.clear(); consts_.push_back({});
-        extra_stack_ = 0;
-        next_offset_ = 0;
-        next_reg_ = 0;
-        max_reg_used_ = 0;
-        max_offset_used_ = 0;
-        scope_reg_base_.clear();
-        scope_off_base_.clear();
-        copy_tab_.clear();
-        copy_stack_.clear();
-        reg_temp_depth_ = 0;
-        loops_.clear();
-
-        // 预分析：临时区大小
-        int np = (int)func->params.size();
-        int nstack = std::max(0, np - 8);   // 栈参数个数
-        int mmt = 0, max_tail = 0;
-        for (auto& s : func->body->stmts) {
-            mmt = std::max(mmt, max_mem_temp_stmt(s.get()));
-            max_tail = std::max(max_tail, max_tail_args(s.get()));
-        }
-        temp_limit_ = 4 * (mmt + 8) + 4 * max_tail + 4 * nstack + 16;
-        temp_base_ = 0;              // 临时区在帧底
-        var_base_ = temp_limit_;     // 溢出变量在临时区之上
-
-        // 分配形参（优先寄存器）
-        for (auto& p : func->params) {
-            alloc_var(p);
-            current_param_vars_.push_back(symtab_.back()[p]);
-        }
-
-        // 先生成函数体到缓冲区，统计实际用到的寄存器/变量数
-        std::ostringstream body_buf;
-        out_.swap(body_buf);
-        for (auto& s : func->body->stmts) {
-            gen_stmt(s.get());
-            if (is_terminator(s.get())) break;  // 死代码：return/break/continue 后跳过
-        }
-        std::string body_str = out_.str();
-        out_.swap(body_buf);
-
-        // 计算帧大小
-        int n_spilled = max_offset_used_ / 4;   // 用最大值，块回收后仍留足空间
-        int n_saved = max_reg_used_;   // 保存整个函数用到的所有 s 寄存器（含已回收块的）
-        int frame = temp_limit_ + n_spilled * 4 + n_saved * 4 + 4;
-        if (np > 8) frame = std::max(frame, (np - 7) * 4);  // 栈参数读取区
-        if (frame < 16) frame = 16;
-        frame = (frame + 15) & ~15;
-        stack_size_ = frame;
-        int save_base = temp_limit_ + n_spilled * 4;  // s 寄存器保存区
-
-        // prologue
-        out_ << ".globl " << func->name << "\n" << func->name << ":\n";
-        out_ << "    addi sp, sp, -" << frame << "\n";
-        out_ << "    sw ra, " << (frame - 4) << "(sp)\n";
-
-        // 读入栈参数（i>=8）暂存到临时区顶部
-        for (int i = 8; i < np; i++) {
-            int caller_off = frame - (i - 8 + 2) * 4;
-            int stage_off = temp_limit_ - (nstack - (i - 8)) * 4;
-            out_ << "    lw t0, " << caller_off << "(sp)\n";
-            out_ << "    sw t0, " << stage_off << "(sp)\n";
-        }
-        // 保存用到的 s 寄存器（callee-saved，调用者值保留）
-        for (int k = 0; k < n_saved; k++)
-            out_ << "    sw s" << k << ", " << (save_base + k * 4) << "(sp)\n";
-        // 绑定 a0-a7 参数
-        for (int i = 0; i < np && i < 8; i++) {
-            VarLoc loc = current_param_vars_[i];
-            if (loc.in_reg) out_ << "    mv s" << loc.reg << ", a" << i << "\n";
-            else out_ << "    sw a" << i << ", " << loc.off << "(sp)\n";
-        }
-        // 绑定栈参数
-        for (int i = 8; i < np; i++) {
-            VarLoc loc = current_param_vars_[i];
-            int stage_off = temp_limit_ - (nstack - (i - 8)) * 4;
-            out_ << "    lw t0, " << stage_off << "(sp)\n";
-            if (loc.in_reg) out_ << "    mv s" << loc.reg << ", t0\n";
-            else out_ << "    sw t0, " << loc.off << "(sp)\n";
-        }
-
-        // 尾递归入口标签
-        if (stmt_has_tail_call(func->body.get()))
-            out_ << ".L" << func->name << "_start:\n";
-
-        // 函数体
-        out_ << body_str;
-
-        // epilogue
-        out_ << ".L" << func->name << "_exit:\n";
-        for (int k = n_saved - 1; k >= 0; k--)
-            out_ << "    lw s" << k << ", " << (save_base + k * 4) << "(sp)\n";
-        out_ << "    lw ra, " << (frame - 4) << "(sp)\n";
-        out_ << "    addi sp, sp, " << frame << "\n";
-        out_ << "    ret\n\n";
-    }
-
-    // 尾递归调用：return 当前函数(新参数) → 绑定参数后跳回函数头
-    void gen_tail_call(const CallExpr* call) {
-        int n = (int)call->args.size();
-        // 先求值所有参数，暂存到临时区顶部（避开参数求值用的低区）
-        for (int i = 0; i < n; i++) {
-            gen_expr(call->args[i].get());
-            out_ << "    sw t0, " << (temp_limit_ - (n - i) * 4) << "(sp)\n";
-        }
-        // 按序绑定到形参位置
-        for (int i = 0; i < n; i++) {
-            out_ << "    lw t0, " << (temp_limit_ - (n - i) * 4) << "(sp)\n";
-            VarLoc loc = current_param_vars_[i];
-            if (loc.in_reg) out_ << "    mv s" << loc.reg << ", t0\n";
-            else out_ << "    sw t0, " << loc.off << "(sp)\n";
-        }
-        out_ << "    j .L" << current_func_ << "_start\n";
     }
 
     void gen_block(const Block* block) {
@@ -651,8 +529,7 @@ private:
                 // 避免深尾递归栈溢出——评测 p06 的根因）
                 if (call && call->func_name == current_func_
                     && call->args.size() == current_params_.size()) {
-                    if (opt_) { gen_tail_call(call); return; }
-                    // 非-opt：参数都在栈槽。先把实参求值并暂存，再按序写入参数槽。
+                    // 参数都在栈槽。先把实参求值并暂存，再按序写入参数槽。
                     // 用临时区顶部暂存，避开表达式求值用的低区。
                     int n = (int)call->args.size();
                     int base = extra_stack_;

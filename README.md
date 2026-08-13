@@ -27,10 +27,11 @@ cmake --build build
 ## 架构
 
 ```
-AST ──► IR（三地址码，虚拟寄存器）──► 优化 pass 链（-opt）──► 寄存器分配 ──► RISC-V 汇编
+AST ──► IR（三地址码，虚拟寄存器）──► 优化（-opt）──► 寄存器分配 ──► RISC-V 汇编
 ```
 
 - `src/lexer.h` `src/parser.h` `src/ast.h` — 词法/语法分析，构建 AST
 - `src/codegen.h` — 非 `-opt` 后端（AST 直接生成汇编）
-- `src/ir_backend.h` `src/closed_form.h` — `-opt` 后端：AST → IR → 优化 → 寄存器分配 → 汇编
-  - 优化：常量折叠、常数传播、复制传播、CSE、死代码删除、代数化简、立即数融合、循环不变量外提、闭合形式循环、尾递归转循环
+- `src/ir_backend.h` — `-opt` 后端：AST → IR → 优化 → 寄存器分配 → 汇编
+  - 优化（基本块内，迭代到不动点）：常量折叠与传播、复制传播、公共子表达式消除、死代码删除、代数化简与立即数融合、尾递归转循环
+  - 寄存器分配：活跃分析（CFG 反向数据流）+ 线性扫描
