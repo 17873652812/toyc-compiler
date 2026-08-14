@@ -400,8 +400,43 @@ private:
         throw std::runtime_error("Codegen: unknown expression");
     }
 
+    // 代数化简：x+0、x-0、x*1、x/1、x*0、x*2^k → 更简单的形式
+    // 有副作用的一侧先求值，保证语义不变
+    bool simplify_binary(const BinaryExpr* bin) {
+        const std::string& op = bin->op;
+        auto lc = try_fold(bin->left.get());
+        auto rc = try_fold(bin->right.get());
+        if (op == "+" && rc && *rc == 0) { gen_expr(bin->left.get()); return true; }
+        if (op == "+" && lc && *lc == 0) { gen_expr(bin->right.get()); return true; }
+        if (op == "-" && rc && *rc == 0) { gen_expr(bin->left.get()); return true; }
+        if (op == "*" && rc && *rc == 1) { gen_expr(bin->left.get()); return true; }
+        if (op == "*" && lc && *lc == 1) { gen_expr(bin->right.get()); return true; }
+        if (op == "/" && rc && *rc == 1) { gen_expr(bin->left.get()); return true; }
+        if (op == "*" && rc && *rc == 0) {
+            if (contains_call(bin->left.get())) gen_expr(bin->left.get());   // 副作用先求值
+            out_ << "    li t0, 0\n"; return true;
+        }
+        if (op == "*" && lc && *lc == 0) {
+            if (contains_call(bin->right.get())) gen_expr(bin->right.get());
+            out_ << "    li t0, 0\n"; return true;
+        }
+        // x * 2^k → slli（移位比乘法快）
+        auto power2 = [](int v) { return v > 0 && (v & (v - 1)) == 0; };
+        auto shift = [](int v) { int k = 0; while (v > 1) { v >>= 1; k++; } return k; };
+        if (op == "*" && rc && power2(*rc)) {
+            gen_expr(bin->left.get());
+            out_ << "    slli t0, t0, " << shift(*rc) << "\n"; return true;
+        }
+        if (op == "*" && lc && power2(*lc)) {
+            gen_expr(bin->right.get());
+            out_ << "    slli t0, t0, " << shift(*lc) << "\n"; return true;
+        }
+        return false;
+    }
+
     // 生成二元运算，结果在 t0
     void gen_bin_expr(const BinaryExpr* bin) {
+        if (simplify_binary(bin)) return;   // 代数化简
         gen_expr(bin->left.get());
         push_t0();
         gen_expr(bin->right.get());
