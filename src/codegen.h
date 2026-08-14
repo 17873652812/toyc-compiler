@@ -118,6 +118,7 @@ private:
         return nullptr;
     }
     std::string current_func_;
+    std::vector<VarLoc> current_param_vars_;   // 当前函数参数的位置（供尾递归绑定）
     struct LoopLabels { int begin, end; };
     std::vector<LoopLabels> loops_;
 
@@ -162,8 +163,9 @@ private:
         max_reg_used_ = 0;
         scope_reg_base_.clear();
 
-        // 参数分配位置（优先寄存器）
-        for (auto& p : func->params) alloc_var(p);
+        // 参数分配位置（优先寄存器），记录位置供尾递归绑定
+        current_param_vars_.clear();
+        for (auto& p : func->params) current_param_vars_.push_back(alloc_var(p));
         int nvars = count_vars(func->body.get());
         int total_vars = (int)func->params.size() + nvars;
         int n_reg = std::min(total_vars, 12);   // 最多 12 个 s 寄存器
@@ -201,6 +203,9 @@ private:
                 else out_ << "    sw t0, " << loc.off << "(sp)\n";
             }
         }
+
+        // 尾递归入口：跳回这里重新绑定参数并循环（不增长栈）
+        out_ << ".L" << func->name << "_start:\n";
 
         // 函数体直接遍历，不通过 gen_block（避免重复 enter_scope）
         for (auto& s : func->body->stmts) {
@@ -274,7 +279,17 @@ private:
             throw std::runtime_error("undefined: " + as->name);
         }
         if (auto* ret = dynamic_cast<const ReturnStmt*>(stmt)) {
-            if (ret->expr) { gen_expr(ret->expr.get()); out_ << "    mv a0, t0\n"; }
+            if (ret->expr) {
+                auto* call = dynamic_cast<const CallExpr*>(ret->expr.get());
+                // 尾递归：return 自调用 → 绑定参数后跳回入口，深递归不爆栈
+                if (call && call->func_name == current_func_
+                    && call->args.size() == current_param_vars_.size()) {
+                    gen_tail_call(call);
+                    return;
+                }
+                gen_expr(ret->expr.get());
+                out_ << "    mv a0, t0\n";
+            }
             out_ << "    j .L" << current_func_ << "_exit\n";
             return;
         }
@@ -483,6 +498,28 @@ private:
         }
         out_ << "    call " << call->func_name << "\n";
         out_ << "    mv t0, a0\n";
+    }
+
+    // 尾递归：return 当前函数(新参数) → 全部参数先暂存，再绑定到形参位，跳回入口循环
+    void gen_tail_call(const CallExpr* call) {
+        int n = (int)call->args.size();
+        // 先求值所有参数暂存到临时区（避免绑定顺序覆盖：实参可能引用形参位）
+        int base = extra_stack_;
+        for (int i = 0; i < n; i++) {
+            gen_expr(call->args[i].get());
+            extra_stack_ += 4;
+            out_ << "    sw t0, " << (temp_base_ + extra_stack_) << "(sp)\n";
+        }
+        // 按序绑定到形参位置
+        for (int i = 0; i < n; i++) {
+            out_ << "    lw t0, " << (temp_base_ + base + (i + 1) * 4) << "(sp)\n";
+            VarLoc loc = current_param_vars_[i];
+            if (loc.in_reg) out_ << "    mv s" << loc.reg << ", t0\n";
+            else out_ << "    sw t0, " << loc.off << "(sp)\n";
+        }
+        extra_stack_ = base;
+        cse_clear();   // 形参被重新绑定，CSE 缓存失效
+        out_ << "    j .L" << current_func_ << "_start\n";
     }
 
     // ---- CSE（公共子表达式消除） ----
