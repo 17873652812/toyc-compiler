@@ -1,31 +1,3 @@
-// ============================================================
-// codegen.h —— 代码生成器（核心模块）
-//
-// 单遍扫描 AST，直接生成 RISC-V 32 位汇编（不引入中间表示 IR）。
-//
-// 【RISC-V 调用约定（本项目采用）】
-//   - 参数：a0-a7 传前 8 个参数，超过 8 个用栈传递
-//   - 返回值：main 的返回值放在 a0（评测系统据此判断正确性）
-//   - 局部变量：分配到 s0-s11（callee-saved，被调函数负责保存/恢复），
-//     超过 12 个溢出到栈
-//   - 临时值：表达式求值过程中的中间结果用 t0、t1 等 t 寄存器，
-//     深度较大时暂存到栈上的临时区
-//
-// 【每个函数的栈帧布局（低地址 → 高地址）】
-//   [溢出变量区] [s寄存器保存区] [临时区256B] [CSE区32B] [ra]
-//   帧大小在生成函数体前预估，生成后按实际使用固定。
-//
-// 【优化（opt_ 为 true 时全部开启，共 6 项）】
-//   1. 寄存器分配：局部变量 → s0-s11，减少访存（含跨作用域复用）
-//   2. 死代码删除：return/break/continue 后不可达语句跳过
-//   3. 公共子表达式消除（CSE）：块内重复表达式缓存复用
-//   4. 寄存器操作数：二元运算左右是寄存器变量时直接操作，省内存往返
-//   5. 尾递归转循环：return 自调用 → 绑定参数跳回入口，深递归不爆栈
-//   6. 代数化简：x+0、x*1、x*2^k 等化简（只认字面量常量，保证正确性）
-//
-// 说明：本编译器始终开启优化（-opt 参数解析但未作区分），
-// 功能测试因此也能快速运行，综合用例不会超时。
-// ============================================================
 #pragma once
 
 #include "ast.h"
@@ -182,7 +154,6 @@ private:
 
     // ---- 函数 ----
 
-    // 生成一个函数：序言（分配栈帧/保存寄存器/绑定参数）→ 函数体 → 尾声（恢复/返回）
     void gen_func(const FuncDef* func) {
         current_func_ = func->name;
         symtab_.clear(); symtab_.push_back({});
@@ -470,9 +441,6 @@ private:
     }
 
     // 代数化简：x+0、x-0、x*1、x/1、x*0、x*2^k → 更简单的形式（副作用侧先求值）
-    // 【代数化简】识别 `x+0`、`x-0`、`x*1`、`x/1` → x；`x*0` → 0；`x*2^k` → slli（移位）。
-    // 安全设计：只用"字面量常量"（NumberExpr）判断，不做整棵表达式折叠，
-    // 避免复杂的常量求值引入正确性问题。含副作用（调用）的一侧先求值，保证语义不变。
     bool simplify_binary(const BinaryExpr* bin) {
         const std::string& op = bin->op;
         auto lc = lit_const(bin->left.get());
@@ -506,22 +474,13 @@ private:
     }
 
     // 生成二元运算，结果在 t0；寄存器操作数直接操作，省 push/pop 内存往返
-    // 生成二元运算，结果在 t0。
-    // 【寄存器操作数优化】左右操作数若是 s 寄存器变量，直接生成
-    //   `add t0, sX, sY` 一条指令，省去"左操作数暂存栈→取回"的内存往返。
-    // 否则退回普通路径：左值暂存到临时区，再与右值运算。
     void gen_bin_expr(const BinaryExpr* bin) {
-        if (simplify_binary(bin)) return;   // 代数化简（优化 6）
-        // 判断左右是否为寄存器变量
+        if (simplify_binary(bin)) return;   // 代数化简
         std::string lr = simple_var_reg(bin->left.get());
         std::string rr = simple_var_reg(bin->right.get());
-        // 两边都是寄存器变量：add t0, sX, sY（一条指令）
         if (!lr.empty() && !rr.empty()) { gen_bin_op2(bin->op, lr, rr); return; }
-        // 右是寄存器变量：先算左到 t0，再 t0 = t0 op sY
         if (!rr.empty()) { gen_expr(bin->left.get()); gen_bin_op2(bin->op, "t0", rr); return; }
-        // 左是寄存器变量：先算右到 t0，再 t0 = sX op t0
         if (!lr.empty()) { gen_expr(bin->right.get()); gen_bin_op2(bin->op, lr, "t0"); return; }
-        // 普通路径：左值暂存临时区，算右值，取回左值，运算
         gen_expr(bin->left.get());
         push_t0();
         gen_expr(bin->right.get());
@@ -582,10 +541,7 @@ private:
         out_ << "    mv t0, a0\n";
     }
 
-    // 【尾递归优化】`return 当前函数(新参数)` 时，不真正调用（不增长栈），
-    // 而是：先求值全部实参暂存 → 绑定到形参位置 → 跳回函数入口重新执行函数体。
-    // 这样深尾递归（如 sum(10万,0)）不会栈溢出。
-    // 注意必须先"全部暂存再统一绑定"，否则实参引用形参位置时会被顺序覆盖。
+    // 尾递归：return 当前函数(新参数) → 全部参数先暂存，再绑定到形参位，跳回入口循环
     void gen_tail_call(const CallExpr* call) {
         int n = (int)call->args.size();
         // 先求值所有参数暂存到临时区（避免绑定顺序覆盖：实参可能引用形参位）
@@ -610,8 +566,6 @@ private:
     // ---- CSE（公共子表达式消除） ----
 
     // 操作数标记：局部变量→"v名字"、常量→"c值"；全局→""（不做CSE，可能被调用改）
-    // 【CSE 实现】操作数标记：局部变量→"v名字"、常量→"c值"；全局→""（不做CSE，可能被调用改）。
-    // 两个简单操作数（变量/常量）才能构造缓存键。
     std::string cse_operand(const ASTNode* e) {
         if (auto* n = dynamic_cast<const NumberExpr*>(e)) return "c" + std::to_string(n->value);
         if (auto* id = dynamic_cast<const IdExpr*>(e)) {

@@ -1,11 +1,3 @@
-// ============================================================
-// ast.h —— 抽象语法树（AST）节点定义
-//
-// Parser 把 Token 流构造成一棵树（AST），Codegen 再遍历这棵树生成汇编。
-// 节点分两类：
-//   - 表达式节点：NumberExpr / IdExpr / BinaryExpr / UnaryExpr / CallExpr
-//   - 语句节点：VarDecl / AssignStmt / IfStmt / WhileStmt / ReturnStmt 等
-// ============================================================
 #pragma once
 
 #include "defs.h"
