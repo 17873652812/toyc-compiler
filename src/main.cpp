@@ -1,3 +1,16 @@
+// ============================================================
+// main.cpp —— 编译器入口
+//
+// 整个编译流程：
+//   源码 (.tc) → Lexer → Token 流 → Parser → AST → Codegen → RISC-V 汇编
+//
+// 命令行用法：
+//   compiler input.tc           编译（不优化）
+//   compiler -opt input.tc      编译并开启优化
+//   compiler < input.tc         从标准输入读取源码
+//
+// 输出：RISC-V 汇编写到标准输出（stdout）。
+// ============================================================
 #include <iostream>
 #include <fstream>
 #include <sstream>
