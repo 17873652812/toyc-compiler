@@ -469,9 +469,42 @@ private:
         return false;
     }
 
+    // 若表达式是 s 寄存器中的局部变量（非 const、非复制源），返回 "sX"；否则空串
+    std::string simple_var_reg(const ASTNode* e) {
+        if (auto* id = dynamic_cast<const IdExpr*>(e)) {
+            if (find_const(id->name)) return "";   // const 是立即数
+            if (copy_tab_.count(id->name)) return "";  // 复制源变量，位置经传播，保守跳过
+            if (VarLoc* loc = find_var(id->name))
+                if (loc->in_reg) return "s" + std::to_string(loc->reg);
+        }
+        return "";
+    }
+
+    // 直接生成 t0 = a op b（a/b 是寄存器名或立即数寄存器）
+    void gen_bin_op2(const std::string& op, const std::string& a, const std::string& b) {
+        if (op == "+") out_ << "    add t0, " << a << ", " << b << "\n";
+        else if (op == "-") out_ << "    sub t0, " << a << ", " << b << "\n";
+        else if (op == "*") out_ << "    mul t0, " << a << ", " << b << "\n";
+        else if (op == "/") out_ << "    div t0, " << a << ", " << b << "\n";
+        else if (op == "%") out_ << "    rem t0, " << a << ", " << b << "\n";
+        else if (op == "<") out_ << "    slt t0, " << a << ", " << b << "\n";
+        else if (op == ">") out_ << "    slt t0, " << b << ", " << a << "\n";
+        else if (op == "<=") out_ << "    slt t0, " << b << ", " << a << "\n    xori t0, t0, 1\n";
+        else if (op == ">=") out_ << "    slt t0, " << a << ", " << b << "\n    xori t0, t0, 1\n";
+        else if (op == "==") out_ << "    sub t0, " << a << ", " << b << "\n    seqz t0, t0\n";
+        else if (op == "!=") out_ << "    sub t0, " << a << ", " << b << "\n    snez t0, t0\n";
+        else throw std::runtime_error("gen_bin_op2: unknown op " + op);
+    }
+
     // 生成二元运算，结果在 t0
     void gen_bin_expr(const BinaryExpr* bin) {
         if (simplify_binary(bin)) return;   // 代数化简
+        // 寄存器操作数：左右若是 s 寄存器变量，直接用作操作数，省 push/pop 内存往返
+        std::string lr = simple_var_reg(bin->left.get());
+        std::string rr = simple_var_reg(bin->right.get());
+        if (!lr.empty() && !rr.empty()) { gen_bin_op2(bin->op, lr, rr); return; }
+        if (!rr.empty()) { gen_expr(bin->left.get()); gen_bin_op2(bin->op, "t0", rr); return; }
+        if (!lr.empty()) { gen_expr(bin->right.get()); gen_bin_op2(bin->op, lr, "t0"); return; }
         gen_expr(bin->left.get());
         push_t0();
         gen_expr(bin->right.get());
