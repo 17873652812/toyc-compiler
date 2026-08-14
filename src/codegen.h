@@ -4,6 +4,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace toyc {
 
@@ -76,6 +77,9 @@ private:
     struct CseEntry { std::string l, r; int slot; };  // 两操作数标记 + 槽位
     std::unordered_map<std::string, CseEntry> cse_map_;  // key(op,l,r) → 条目
 
+    // ---- 复制传播 ----
+    std::unordered_map<std::string, std::string> copy_tab_;  // 变量 → 其来源变量（x=y → x→y）
+
     // 进入/退出作用域：记录寄存器水位，退出时回收块内变量占用的寄存器
     void enter_scope() {
         symtab_.push_back({}); consts_.push_back({});
@@ -85,6 +89,7 @@ private:
         symtab_.pop_back(); consts_.pop_back();
         next_reg_ = scope_reg_base_.back();   // 回收块内寄存器
         scope_reg_base_.pop_back();
+        copy_tab_.clear();   // 块内变量销毁，复制源可能失效，清空副本表
     }
 
     // 分配变量位置：优先 s 寄存器，超 12 个溢出到栈
@@ -247,7 +252,12 @@ private:
 
         if (auto* vd = dynamic_cast<const VarDecl*>(stmt)) {
             gen_expr(vd->init.get());
+            invalidate_copy(vd->name);
             cse_invalidate(vd->name);   // 新变量可能遮蔽同名旧变量，CSE 失效
+            // 复制传播：int x = y → x 读 y 的位置
+            if (auto* sid = dynamic_cast<const IdExpr*>(vd->init.get()))
+                if (find_var(sid->name) && !global_vars_.count(sid->name))
+                    copy_tab_[vd->name] = copy_source(sid->name);
             VarLoc loc = alloc_var(vd->name);
             if (loc.in_reg) out_ << "    mv s" << loc.reg << ", t0\n";
             else out_ << "    sw t0, " << loc.off << "(sp)\n";
@@ -257,7 +267,12 @@ private:
             VarLoc* loc = find_var(as->name);
             if (loc) {
                 gen_expr(as->expr.get());
+                invalidate_copy(as->name);
                 cse_invalidate(as->name);   // 变量被赋值，以它为操作数的缓存失效
+                // 复制传播：x = y → x 读 y 的位置
+                if (auto* sid = dynamic_cast<const IdExpr*>(as->expr.get()))
+                    if (find_var(sid->name) && !global_vars_.count(sid->name))
+                        copy_tab_[as->name] = copy_source(sid->name);
                 if (loc->in_reg) out_ << "    mv s" << loc->reg << ", t0\n";
                 else out_ << "    sw t0, " << loc->off << "(sp)\n";
                 return;
@@ -332,6 +347,34 @@ private:
         throw std::runtime_error("Codegen: unknown statement");
     }
 
+    // ---- 复制传播 ----
+
+    // 构造一个临时 IdExpr（复制传播读源变量用）
+    std::unique_ptr<ASTNode> make_id(const std::string& name) {
+        return std::make_unique<IdExpr>(name);
+    }
+
+    // 沿复制表追踪变量到最终源（防循环）
+    std::string copy_source(const std::string& name) {
+        std::string cur = name;
+        std::unordered_set<std::string> seen;
+        while (seen.insert(cur).second) {
+            auto it = copy_tab_.find(cur);
+            if (it == copy_tab_.end()) break;
+            cur = it->second;
+        }
+        return cur;
+    }
+
+    // 变量 x 被赋值/声明后：清除 x 自身及所有"源为 x"的副本（值已过时）
+    void invalidate_copy(const std::string& x) {
+        copy_tab_.erase(x);
+        for (auto it = copy_tab_.begin(); it != copy_tab_.end(); ) {
+            if (it->second == x) it = copy_tab_.erase(it);
+            else ++it;
+        }
+    }
+
     // ---- 表达式 ----
 
     void gen_expr(const ASTNode* expr) {
@@ -340,6 +383,9 @@ private:
             return;
         }
         if (auto* id = dynamic_cast<const IdExpr*>(expr)) {
+            // 复制传播：x = y 后读 x 直接用 y 的位置
+            auto cp = copy_tab_.find(id->name);
+            if (cp != copy_tab_.end()) { gen_expr(make_id(cp->second).get()); return; }
             // 查找顺序：常量 > 局部变量 > 全局变量
             int* cv = find_const(id->name);
             if (cv) { out_ << "    li t0, " << *cv << "\n"; return; }
@@ -492,6 +538,7 @@ private:
         if (auto* n = dynamic_cast<const NumberExpr*>(e)) return "c" + std::to_string(n->value);
         if (auto* id = dynamic_cast<const IdExpr*>(e)) {
             if (global_vars_.count(id->name)) return "";
+            if (copy_tab_.count(id->name)) return "";   // 复制源变量值跟随源，缓存失效难追踪
             return "v" + id->name;
         }
         return "";
