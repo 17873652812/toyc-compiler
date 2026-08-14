@@ -94,6 +94,7 @@ private:
         next_reg_ = scope_reg_base_.back();   // 回收块内寄存器
         scope_reg_base_.pop_back();
         copy_tab_.clear();   // 块内变量销毁，复制源可能失效，清空副本表
+        cse_clear();         // 同名变量可能在外层再次出现，CSE 键按名字，跨块会撞键，清空
     }
 
     // 分配变量位置：优先 s 寄存器，超 12 个溢出到栈
@@ -583,7 +584,8 @@ private:
             else out_ << "    sw t0, " << loc.off << "(sp)\n";
         }
         extra_stack_ = base;
-        cse_clear();   // 形参被重新绑定，CSE 缓存失效
+        cse_clear();         // 形参被重新绑定，CSE 缓存失效
+        copy_tab_.clear();   // 副本也失效：指向形参的副本在新一轮绑定后过时
         out_ << "    j .L" << current_func_ << "_start\n";
     }
 
