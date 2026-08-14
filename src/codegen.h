@@ -407,23 +407,6 @@ private:
             // 短路计算（v1.0）
             if (bin->op == "&&") { gen_short_circuit_and(bin); return; }
             if (bin->op == "||") { gen_short_circuit_or(bin); return; }
-            // CSE（公共子表达式消除）：简单操作数的重复表达式 → 复用缓存结果
-            std::string l, r;
-            std::string key = cse_key(bin, l, r);
-            if (!key.empty()) {
-                auto it = cse_map_.find(key);
-                if (it != cse_map_.end()) {
-                    out_ << "    lw t0, " << (cse_base_ + it->second.slot * 4) << "(sp)\n";
-                    return;
-                }
-                gen_bin_expr(bin);           // 首次计算，结果在 t0
-                if (cse_count_ < CSE_SLOTS) {
-                    int slot = cse_count_++;
-                    out_ << "    sw t0, " << (cse_base_ + slot * 4) << "(sp)\n";
-                    cse_map_[key] = {l, r, slot};
-                }
-                return;
-            }
             gen_bin_expr(bin);
             return;
         }
