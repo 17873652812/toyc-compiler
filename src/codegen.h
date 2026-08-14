@@ -3,7 +3,9 @@
 #include "ast.h"
 #include <sstream>
 #include <stdexcept>
+#include <optional>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace toyc {
 
@@ -325,6 +327,11 @@ private:
     // ---- 表达式 ----
 
     void gen_expr(const ASTNode* expr) {
+        // 常量折叠：整棵表达式可编译期求值 → 直接 li，不生成运算代码
+        if (auto v = try_fold(expr)) {
+            out_ << "    li t0, " << *v << "\n";
+            return;
+        }
         if (auto* num = dynamic_cast<const NumberExpr*>(expr)) {
             out_ << "    li t0, " << num->value << "\n";
             return;
@@ -534,6 +541,43 @@ private:
             return v;
         }
         throw std::runtime_error("non-const expression in const init");
+    }
+
+    // 编译期求值整棵表达式（常量折叠）；含调用/除零/非常量时返回空，保持运行时行为
+    std::optional<int> try_fold(const ASTNode* e) {
+        if (contains_call(e)) return std::nullopt;
+        if (auto* n = dynamic_cast<const NumberExpr*>(e)) return n->value;
+        if (auto* id = dynamic_cast<const IdExpr*>(e)) {
+            int* cv = find_const(id->name);
+            if (cv) return *cv;
+            return std::nullopt;   // 非常量变量/全局，运行时才知道值
+        }
+        if (auto* un = dynamic_cast<const UnaryExpr*>(e)) {
+            auto v = try_fold(un->expr.get());
+            if (!v) return std::nullopt;
+            return (un->op == "!") ? (*v == 0 ? 1 : 0) : -(*v);
+        }
+        if (auto* bin = dynamic_cast<const BinaryExpr*>(e)) {
+            auto l = try_fold(bin->left.get());
+            auto r = try_fold(bin->right.get());
+            if (!l || !r) return std::nullopt;
+            if ((bin->op == "/" || bin->op == "%") && *r == 0) return std::nullopt;
+            if (bin->op == "+") return *l + *r;
+            if (bin->op == "-") return *l - *r;
+            if (bin->op == "*") return *l * *r;
+            if (bin->op == "/") return *l / *r;
+            if (bin->op == "%") return *l % *r;
+            if (bin->op == "<") return *l < *r ? 1 : 0;
+            if (bin->op == ">") return *l > *r ? 1 : 0;
+            if (bin->op == "<=") return *l <= *r ? 1 : 0;
+            if (bin->op == ">=") return *l >= *r ? 1 : 0;
+            if (bin->op == "==") return *l == *r ? 1 : 0;
+            if (bin->op == "!=") return *l != *r ? 1 : 0;
+            if (bin->op == "&&") return (*l && *r) ? 1 : 0;
+            if (bin->op == "||") return (*l || *r) ? 1 : 0;
+            return std::nullopt;
+        }
+        return std::nullopt;
     }
 
     // ---- 临时栈（用帧内正偏移，函数调用不会覆盖） ----
