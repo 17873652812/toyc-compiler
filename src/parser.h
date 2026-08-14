@@ -240,11 +240,22 @@ private:
         return left;
     }
 
+    // 关系层：== !=（优先级低于 < > <= >=，高于 &&）—— C 语义
     std::unique_ptr<ASTNode> parse_rel_expr() {
+        auto left = parse_cmp_expr();
+        while (check(TokenKind::EQ) || check(TokenKind::NE)) {
+            std::string op = advance().lexeme;
+            auto right = parse_cmp_expr();
+            left = std::make_unique<BinaryExpr>(std::move(left), op, std::move(right));
+        }
+        return left;
+    }
+
+    // 比较层：< > <= >=（优先级高于 == !=，低于 + -）
+    std::unique_ptr<ASTNode> parse_cmp_expr() {
         auto left = parse_add_expr();
         while (check(TokenKind::LT) || check(TokenKind::GT)
-               || check(TokenKind::LE) || check(TokenKind::GE)
-               || check(TokenKind::EQ) || check(TokenKind::NE)) {
+               || check(TokenKind::LE) || check(TokenKind::GE)) {
             std::string op = advance().lexeme;
             auto right = parse_add_expr();
             left = std::make_unique<BinaryExpr>(std::move(left), op, std::move(right));
